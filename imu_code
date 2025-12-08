@@ -1,0 +1,79 @@
+# imu_read_lsm6ds3_ascii.py
+# Works for LSM6DS3 / LSM6DSL at I2C address 0x6A
+
+from smbus2 import SMBus
+import time
+
+ADDR = 0x6A  # IMU I2C address
+
+# Register map
+WHO_AM_I   = 0x0F
+CTRL1_XL   = 0x10
+CTRL2_G    = 0x11
+OUTX_L_G   = 0x22
+OUTX_L_XL  = 0x28
+
+
+def read16(bus, reg):
+    low = bus.read_byte_data(ADDR, reg)
+    high = bus.read_byte_data(ADDR, reg + 1)
+    val = (high << 8) | low
+    if val >= 32768:
+        val -= 65536
+    return val
+
+
+def main():
+    print("Initializing IMU at 0x6A...")
+
+    bus = SMBus(1)
+
+    whoami = bus.read_byte_data(ADDR, WHO_AM_I)
+    print("WHO_AM_I register:", hex(whoami))
+
+    # Enable accelerometer: 104 Hz, 2 g
+    bus.write_byte_data(ADDR, CTRL1_XL, 0x40)
+
+    # Enable gyroscope: 104 Hz, 245 dps
+    bus.write_byte_data(ADDR, CTRL2_G, 0x40)
+
+    time.sleep(0.1)
+
+    try:
+        while True:
+            # Read gyro raw values
+            gx = read16(bus, OUTX_L_G)
+            gy = read16(bus, OUTX_L_G + 2)
+            gz = read16(bus, OUTX_L_G + 4)
+
+            # Read accel raw values
+            ax = read16(bus, OUTX_L_XL)
+            ay = read16(bus, OUTX_L_XL + 2)
+            az = read16(bus, OUTX_L_XL + 4)
+
+            # Convert to physical units
+            ax_g = ax * 0.061 / 1000.0
+            ay_g = ay * 0.061 / 1000.0
+            az_g = az * 0.061 / 1000.0
+
+            gx_dps = gx * 8.75 / 1000.0
+            gy_dps = gy * 8.75 / 1000.0
+            gz_dps = gz * 8.75 / 1000.0
+
+            print(
+                "Accel[g]: X={:.3f}, Y={:.3f}, Z={:.3f} | "
+                "Gyro[dps]: X={:.2f}, Y={:.2f}, Z={:.2f}".format(
+                    ax_g, ay_g, az_g, gx_dps, gy_dps, gz_dps
+                )
+            )
+
+            time.sleep(0.5)
+
+    except KeyboardInterrupt:
+        print("\nStopped.")
+    finally:
+        bus.close()
+
+
+if __name__ == "__main__":
+    main()
