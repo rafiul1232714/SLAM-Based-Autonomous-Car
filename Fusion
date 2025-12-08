@@ -1,0 +1,300 @@
+# File: fuse_gps_imu.py
+# Simple GPS + IMU fusion for Raspberry Pi (for small SLAM car prototype)
+# GPS: UART on /dev/serial0 (NMEA)
+# IMU: LSM6DS3 / LSM6DSL on I2C address 0x6A
+
+from __future__ import annotations
+import re
+import time
+import math
+from dataclasses import dataclass
+from typing import Optional, Tuple
+
+import serial          # pyserial
+from smbus2 import SMBus
+
+
+# ---------- GPS PART ----------
+
+PORT = "/dev/serial0"
+BAUDS = [9600, 38400, 115200, 4800]
+RAW = False  # True for debugging raw NMEA
+
+_NMEA = re.compile(r"^\$(?P<body>[^*]+)\*(?P<chk>[0-9A-Fa-f]{2})$")
+_ASCII = set(range(0x20, 0x7F)) | {10, 13}
+
+
+def _san(b: bytes) -> str:
+    s = b.decode("ascii", errors="replace")
+    return "".join(ch if ord(ch) in _ASCII else "?" for ch in s).strip()
+
+
+def _cs(body: str) -> int:
+    x = 0
+    for c in body:
+        x ^= ord(c)
+    return x
+
+
+def _split(line: str) -> Optional[Tuple[str, list[str]]]:
+    m = _NMEA.match(line)
+    if not m:
+        return None
+    body, got = m["body"], int(m["chk"], 16)
+    if _cs(body) != got:
+        return None
+    parts = body.split(",")
+    return parts[0], parts
+
+
+def _latlon(v: str, h: str) -> Optional[float]:
+    if not v or "." not in v:
+        return None
+    d = 2 if h in ("N", "S") else 3
+    try:
+        deg = int(v[:d])
+        mins = float(v[d:])
+        out = deg + mins / 60.0
+        return -out if h in ("S", "W") else out
+    except ValueError:
+        return None
+
+
+@dataclass
+class Fix:
+    utc: Optional[str] = None
+    lat: Optional[float] = None
+    lon: Optional[float] = None
+    alt_m: Optional[float] = None
+    sats: Optional[int] = None
+    hdop: Optional[float] = None
+    spd_kmh: Optional[float] = None
+    course_deg: Optional[float] = None
+    state: str = "no-fix"
+
+
+def _apply_gga(f: Fix, p: list[str]) -> None:
+    f.utc = p[1] or f.utc
+    f.lat = _latlon(p[2], p[3]) or f.lat
+    f.lon = _latlon(p[4], p[5]) or f.lon
+    f.state = {
+        "0": "no-fix",
+        "1": "GPS",
+        "2": "DGPS",
+        "4": "RTK",
+        "5": "Float",
+        "6": "DR",
+    }.get(p[6], f.state)
+    f.sats = int(p[7]) if p[7] else f.sats
+    f.hdop = float(p[8]) if p[8] else f.hdop
+    f.alt_m = float(p[9]) if p[9] else f.alt_m
+
+
+def _apply_rmc(f: Fix, p: list[str]) -> None:
+    f.utc = p[1] or f.utc
+    f.state = "GPS" if p[2] == "A" else "no-fix"
+    f.lat = _latlon(p[3], p[4]) or f.lat
+    f.lon = _latlon(p[5], p[6]) or f.lon
+    f.spd_kmh = (float(p[7]) * 1.852) if p[7] else f.spd_kmh
+    f.course_deg = float(p[8]) if len(p) > 8 and p[8] else f.course_deg
+
+
+def _autobaud(port: str, bauds: list[int], seconds: float = 3.0) -> serial.Serial:
+    for b in bauds:
+        try:
+            ser = serial.Serial(port, b, timeout=0.3)
+        except Exception:
+            continue
+        t0 = time.time()
+        ok = False
+        while time.time() - t0 < seconds:
+            line = _san(ser.readline())
+            if RAW and line:
+                print(line)
+            if _split(line):
+                ok = True
+                break
+        if ok:
+            print("[GPS] auto-baud locked @", b)
+            return ser
+        try:
+            ser.close()
+        except Exception:
+            pass
+    raise SystemExit("No valid NMEA found. Check wiring / sky view.")
+
+
+# ---------- IMU PART (LSM6DS3 / LSM6DSL @ 0x6A) ----------
+
+IMU_ADDR = 0x6A
+WHO_AM_I = 0x0F
+CTRL1_XL = 0x10
+CTRL2_G = 0x11
+OUTX_L_G = 0x22
+OUTX_L_XL = 0x28
+
+
+def imu_read16(bus: SMBus, reg: int) -> int:
+    low = bus.read_byte_data(IMU_ADDR, reg)
+    high = bus.read_byte_data(IMU_ADDR, reg + 1)
+    val = (high << 8) | low
+    if val >= 32768:
+        val -= 65536
+    return val
+
+
+def init_imu(bus: SMBus) -> None:
+    who = bus.read_byte_data(IMU_ADDR, WHO_AM_I)
+    print("IMU WHO_AM_I:", hex(who))
+    bus.write_byte_data(IMU_ADDR, CTRL1_XL, 0x40)  # accel on
+    bus.write_byte_data(IMU_ADDR, CTRL2_G, 0x40)   # gyro on
+    time.sleep(0.1)
+
+
+def read_imu(bus: SMBus):
+    gx_raw = imu_read16(bus, OUTX_L_G)
+    gy_raw = imu_read16(bus, OUTX_L_G + 2)
+    gz_raw = imu_read16(bus, OUTX_L_G + 4)
+    ax_raw = imu_read16(bus, OUTX_L_XL)
+    ay_raw = imu_read16(bus, OUTX_L_XL + 2)
+    az_raw = imu_read16(bus, OUTX_L_XL + 4)
+
+    ax_g = ax_raw * 0.061 / 1000.0
+    ay_g = ay_raw * 0.061 / 1000.0
+    az_g = az_raw * 0.061 / 1000.0
+
+    gx_dps = gx_raw * 8.75 / 1000.0
+    gy_dps = gy_raw * 8.75 / 1000.0
+    gz_dps = gz_raw * 8.75 / 1000.0
+
+    return ax_g, ay_g, az_g, gx_dps, gy_dps, gz_dps
+
+
+# ---------- SIMPLE FUSION MODEL ----------
+
+@dataclass
+class NavState:
+    x_m: float = 0.0
+    y_m: float = 0.0
+    heading_rad: float = 0.0  # 0 = East, pi/2 = North
+    v_mps: float = 0.0
+
+
+def latlon_to_xy(lat0: float, lon0: float, lat: float, lon: float):
+    """Approximate conversion from lat/lon to local x,y in meters."""
+    scale_lat = 111320.0
+    scale_lon = 111320.0 * math.cos(math.radians(lat0))
+    dy = (lat - lat0) * scale_lat
+    dx = (lon - lon0) * scale_lon
+    return dx, dy
+
+
+def main() -> None:
+    print("Opening GPS and IMU... Ctrl+C to stop")
+
+    # Open GPS
+    ser = _autobaud(PORT, BAUDS)
+
+    # Open IMU
+    bus = SMBus(1)
+    init_imu(bus)
+
+    fix = Fix()
+    state = NavState()
+    origin_lat = None
+    origin_lon = None
+
+    last_t = time.time()
+    last_print = 0.0
+    alpha_pos = 0.3  # GPS weight vs dead-reckoning
+
+    try:
+        while True:
+            now = time.time()
+            dt = now - last_t
+            if dt <= 0:
+                dt = 1e-3
+            last_t = now
+
+            # --- GPS: read one line ---
+            line = _san(ser.readline())
+            if RAW and line:
+                print(line)
+            parsed = _split(line)
+            if parsed:
+                kind, p = parsed
+                if kind.endswith("GGA"):
+                    _apply_gga(fix, p)
+                elif kind.endswith("RMC"):
+                    _apply_rmc(fix, p)
+
+            # --- IMU: read sample ---
+            ax_g, ay_g, az_g, gx_dps, gy_dps, gz_dps = read_imu(bus)
+
+            # integrate gyro Z to heading
+            gz_rad = gz_dps * math.pi / 180.0
+            state.heading_rad += gz_rad * dt
+            if state.heading_rad > math.pi:
+                state.heading_rad -= 2.0 * math.pi
+            elif state.heading_rad < -math.pi:
+                state.heading_rad += 2.0 * math.pi
+
+            # set forward velocity from GPS when available
+            if fix.spd_kmh is not None and fix.state == "GPS":
+                state.v_mps = fix.spd_kmh / 3.6
+
+            # dead-reckoning position
+            state.x_m += state.v_mps * dt * math.cos(state.heading_rad)
+            state.y_m += state.v_mps * dt * math.sin(state.heading_rad)
+
+            # GPS position correction
+            if fix.state == "GPS" and fix.lat is not None and fix.lon is not None:
+                if origin_lat is None:
+                    origin_lat = fix.lat
+                    origin_lon = fix.lon
+                    state.x_m = 0.0
+                    state.y_m = 0.0
+                else:
+                    gx, gy = latlon_to_xy(origin_lat, origin_lon, fix.lat, fix.lon)
+                    state.x_m = alpha_pos * gx + (1.0 - alpha_pos) * state.x_m
+                    state.y_m = alpha_pos * gy + (1.0 - alpha_pos) * state.y_m
+
+            # print at 1 Hz
+            if now - last_print >= 1.0:
+                last_print = now
+                heading_deg = state.heading_rad * 180.0 / math.pi
+                print(
+                    "UTC {utc} | {st:6} | lat {lat} lon {lon} | v_gps {vgps:.2f} km/h | "
+                    "sats {sats} | hdop {hd:.2f} | "
+                    "IMU gz {gz:.2f} dps | NAV x {x:.2f} m, y {y:.2f} m, heading {hdg:.1f} deg".format(
+                        utc=fix.utc or "-",
+                        st=fix.state,
+                        lat="{:.6f}".format(fix.lat) if fix.lat is not None else "-",
+                        lon="{:.6f}".format(fix.lon) if fix.lon is not None else "-",
+                        vgps=fix.spd_kmh or 0.0,
+                        sats=fix.sats or 0,
+                        hd=fix.hdop or 99.99,
+                        gz=gz_dps,
+                        x=state.x_m,
+                        y=state.y_m,
+                        hdg=heading_deg,
+                    )
+                )
+
+            time.sleep(0.01)
+
+    except KeyboardInterrupt:
+        print("\nBye.")
+    finally:
+        try:
+            ser.close()
+        except Exception:
+            pass
+        try:
+            bus.close()
+        except Exception:
+            pass
+
+
+if __name__ == "__main__":
+    main()
