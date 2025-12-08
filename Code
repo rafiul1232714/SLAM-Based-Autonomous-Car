@@ -1,1 +1,134 @@
 
+# File: gps_view_autobaud.py
+"""
+Raspberry Pi GPS viewer (auto-baud, safe for Thonny).
+Wiring: GPS TXD -> Pi RX (GPIO15/pin10), GPS RXD -> Pi TX (GPIO14/pin8), VCC->5V, GND->GND.
+Prereqs: UART enabled, serial-login disabled, `pip install pyserial` (via Thonny).
+"""
+
+from __future__ import annotations
+import re, time
+from dataclasses import dataclass
+from typing import Optional, Tuple
+import serial  # pyserial
+
+PORT = "/dev/serial0"
+BAUDS = [9600, 38400, 115200, 4800]   # order matters; most modules are 9600
+RAW = False                           # True = also print raw NMEA lines
+
+# --- helpers (keep output ASCII-only to avoid Thonny encoding errors) ---
+_NMEA = re.compile(r"^\$(?P<body>[^*]+)\*(?P<chk>[0-9A-Fa-f]{2})$")
+_ASCII = set(range(0x20, 0x7F)) | {10, 13}
+
+def _san(b: bytes) -> str:
+    s = b.decode("ascii", errors="replace")
+    return "".join(ch if ord(ch) in _ASCII else "?" for ch in s).strip()
+
+def _cs(body: str) -> int:
+    x = 0
+    for c in body: x ^= ord(c)
+    return x
+
+def _split(line: str) -> Optional[Tuple[str, list[str]]]:
+    m = _NMEA.match(line)
+    if not m: return None
+    body, got = m["body"], int(m["chk"], 16)
+    if _cs(body) != got: return None
+    parts = body.split(",")
+    return parts[0], parts
+
+def _latlon(v: str, h: str) -> Optional[float]:
+    if not v or "." not in v: return None
+    d = 2 if h in ("N","S") else 3
+    try:
+        deg, mins = int(v[:d]), float(v[d:])
+        out = deg + mins/60.0
+        return -out if h in ("S","W") else out
+    except ValueError:
+        return None
+
+# --- model ---
+@dataclass
+class Fix:
+    utc: Optional[str]=None
+    lat: Optional[float]=None
+    lon: Optional[float]=None
+    alt_m: Optional[float]=None
+    sats: Optional[int]=None
+    hdop: Optional[float]=None
+    spd_kmh: Optional[float]=None
+    state: str="no-fix"
+
+def _apply_gga(f: Fix, p: list[str]) -> None:
+    f.utc = p[1] or f.utc
+    f.lat = _latlon(p[2], p[3]) or f.lat
+    f.lon = _latlon(p[4], p[5]) or f.lon
+    f.state = {"0":"no-fix","1":"GPS","2":"DGPS","4":"RTK","5":"Float","6":"DR"}.get(p[6], f.state)
+    f.sats = int(p[7]) if p[7] else f.sats
+    f.hdop = float(p[8]) if p[8] else f.hdop
+    f.alt_m = float(p[9]) if p[9] else f.alt_m
+
+def _apply_rmc(f: Fix, p: list[str]) -> None:
+    f.utc = p[1] or f.utc
+    f.state = "GPS" if p[2] == "A" else "no-fix"
+    f.lat = _latlon(p[3], p[4]) or f.lat
+    f.lon = _latlon(p[5], p[6]) or f.lon
+    f.spd_kmh = (float(p[7]) * 1.852) if p[7] else f.spd_kmh  # knots?km/h
+
+def _autobaud(port: str, bauds: list[int], seconds: float = 3.0) -> serial.Serial:
+    # Tries each baud briefly until a valid NMEA checksum appears.
+    for b in bauds:
+        try:
+            ser = serial.Serial(port, b, timeout=0.3)
+        except Exception:
+            continue
+        t0 = time.time()
+        ok = False
+        while time.time() - t0 < seconds:
+            line = _san(ser.readline())
+            if RAW and line: print(line)
+            if _split(line):
+                ok = True
+                break
+        if ok:
+            print(f"[auto-baud] locked @ {b}")
+            return ser
+        try: ser.close()
+        except Exception: pass
+    raise SystemExit("No valid NMEA found. Check wiring, power, sky view, or try different baud rates.")
+
+def _fmt(x) -> str:
+    if isinstance(x, float): return f"{x:.6f}"
+    return x if x is not None else "-"
+
+def main() -> None:
+    print(f"Opening {PORT} (auto-baud)  Ctrl+C to stop")
+    ser = _autobaud(PORT, BAUDS)
+    fix, last = Fix(), 0.0
+    try:
+        while True:
+            line = _san(ser.readline())
+            if RAW and line: print(line)
+            parsed = _split(line)
+            if parsed:
+                kind, p = parsed
+                if kind.endswith("GGA"): _apply_gga(fix, p)
+                elif kind.endswith("RMC"): _apply_rmc(fix, p)
+            now = time.time()
+            if now - last >= 1.0:
+                print(
+                    f"UTC {fix.utc or '-'} | {fix.state:6} | "
+                    f"lat {_fmt(fix.lat)}, lon {_fmt(fix.lon)} | "
+                    f"spd {_fmt(fix.spd_kmh)} km/h | sats {_fmt(fix.sats)} | "
+                    f"hdop {_fmt(fix.hdop)} | alt {_fmt(fix.alt_m)} m"
+                )
+                last = now
+    except KeyboardInterrupt:
+        print("\nBye.")
+    finally:
+        try: ser.close()
+        except Exception: pass
+
+if __name__ == "__main__":
+    main()
+
