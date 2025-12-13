@@ -1,1 +1,427 @@
-.
+#!/usr/bin/env python3
+import time, math, re
+import numpy as np
+import smbus
+import serial
+
+# =========================
+#   Hardware / Ports
+# =========================
+I2C_BUS = 1
+MPU_ADDR = 0x68
+GPS_PORT = "/dev/serial0"
+GPS_BAUD = 9600  # if you already use auto-baud, plug it in here; keep fixed for EKF loop
+
+# =========================
+#   Helpers
+# =========================
+def twos16(v):
+    return v - 65536 if v & 0x8000 else v
+
+def clamp(x, a, b):
+    return a if x < a else b if x > b else x
+
+# =========================
+#   MPU6050 (Accel+Gyro)
+# =========================
+class MPU6050:
+    def __init__(self, bus, addr=MPU_ADDR):
+        self.bus = bus
+        self.addr = addr
+
+        # Wake up
+        self.bus.write_byte_data(self.addr, 0x6B, 0x00)
+        time.sleep(0.05)
+
+        # Gyro ±250 dps, Acc ±2g (most sensitive)
+        self.bus.write_byte_data(self.addr, 0x1B, 0x00)
+        self.bus.write_byte_data(self.addr, 0x1C, 0x00)
+        time.sleep(0.01)
+
+        # Scale factors
+        self.acc_lsb_per_g = 16384.0
+        self.gyro_lsb_per_dps = 131.0
+
+        # Simple bias estimates (set via calibrate())
+        self.gyro_bias_dps = np.zeros(3)
+        self.acc_bias_g = np.zeros(3)
+
+    def _read_i16(self, reg):
+        hi = self.bus.read_byte_data(self.addr, reg)
+        lo = self.bus.read_byte_data(self.addr, reg + 1)
+        return twos16((hi << 8) | lo)
+
+    def read(self):
+        ax = self._read_i16(0x3B)
+        ay = self._read_i16(0x3D)
+        az = self._read_i16(0x3F)
+        gx = self._read_i16(0x43)
+        gy = self._read_i16(0x45)
+        gz = self._read_i16(0x47)
+
+        acc_g = np.array([ax, ay, az]) / self.acc_lsb_per_g
+        gyro_dps = np.array([gx, gy, gz]) / self.gyro_lsb_per_dps
+
+        acc_g = acc_g - self.acc_bias_g
+        gyro_dps = gyro_dps - self.gyro_bias_dps
+
+        # Convert gyro to rad/s
+        gyro_rads = np.deg2rad(gyro_dps)
+        return acc_g, gyro_rads
+
+    def calibrate(self, seconds=3.0, hz=200):
+        """
+        Keep the IMU perfectly still and flat (Z up) during calibration.
+        Estimates gyro bias; accel bias only for X/Y (Z expects ~+1g).
+        """
+        n = int(seconds * hz)
+        acc_sum = np.zeros(3)
+        gyro_sum = np.zeros(3)
+        dt = 1.0 / hz
+
+        print(f"[cal] Hold IMU still for {seconds:.1f}s ...")
+        for _ in range(n):
+            acc_g, gyro_rads = self.read()
+            acc_sum += acc_g
+            gyro_sum += np.rad2deg(gyro_rads)  # store in dps for bias
+            time.sleep(dt)
+
+        acc_mean = acc_sum / n
+        gyro_mean_dps = gyro_sum / n
+
+        # gyro bias in dps
+        self.gyro_bias_dps = gyro_mean_dps
+
+        # accel bias: assume expected [0,0,+1]
+        self.acc_bias_g = np.array([acc_mean[0], acc_mean[1], acc_mean[2] - 1.0])
+
+        print("[cal] gyro_bias_dps:", self.gyro_bias_dps)
+        print("[cal] acc_bias_g:", self.acc_bias_g)
+
+# =========================
+#   Madgwick IMU (no mag)
+#   - updateIMU() only
+# =========================
+class MadgwickIMU:
+    def __init__(self, beta=0.08):
+        # beta: higher = faster correction (more accel noise), lower = smoother (more drift)
+        self.beta = beta
+        self.q = np.array([1.0, 0.0, 0.0, 0.0], dtype=float)  # [w,x,y,z]
+
+    def update_imu(self, gx, gy, gz, ax, ay, az, dt):
+        # Normalize accelerometer
+        norm = math.sqrt(ax*ax + ay*ay + az*az)
+        if norm < 1e-9:
+            return
+        ax, ay, az = ax/norm, ay/norm, az/norm
+
+        q1, q2, q3, q4 = self.q  # w,x,y,z
+
+        # Gradient descent step (IMU variant)
+        f1 = 2*(q2*q4 - q1*q3) - ax
+        f2 = 2*(q1*q2 + q3*q4) - ay
+        f3 = 2*(0.5 - q2*q2 - q3*q3) - az
+
+        J_11or24 = 2*q3
+        J_12or23 = 2*q4
+        J_13or22 = 2*q1
+        J_14or21 = 2*q2
+        J_32 = 4*q2
+        J_33 = 4*q3
+
+        s1 = J_11or24*f1 + J_14or21*f2
+        s2 = J_12or23*f1 + J_13or22*f2 - J_32*f3
+        s3 = J_12or23*f2 - J_33*f3 - J_13or22*f1
+        s4 = J_11or24*f2 + J_14or21*f1
+
+        norm_s = math.sqrt(s1*s1 + s2*s2 + s3*s3 + s4*s4)
+        if norm_s > 1e-9:
+            s1, s2, s3, s4 = s1/norm_s, s2/norm_s, s3/norm_s, s4/norm_s
+
+        # Quaternion rate from gyro
+        qDot1 = 0.5 * (-q2*gx - q3*gy - q4*gz) - self.beta*s1
+        qDot2 = 0.5 * ( q1*gx + q3*gz - q4*gy) - self.beta*s2
+        qDot3 = 0.5 * ( q1*gy - q2*gz + q4*gx) - self.beta*s3
+        qDot4 = 0.5 * ( q1*gz + q2*gy - q3*gx) - self.beta*s4
+
+        q1 += qDot1 * dt
+        q2 += qDot2 * dt
+        q3 += qDot3 * dt
+        q4 += qDot4 * dt
+
+        # Normalize quaternion
+        norm_q = math.sqrt(q1*q1 + q2*q2 + q3*q3 + q4*q4)
+        self.q = np.array([q1, q2, q3, q4]) / norm_q
+
+    def euler(self):
+        # returns roll, pitch, yaw in radians
+        w, x, y, z = self.q
+        # roll (x-axis)
+        sinr = 2*(w*x + y*z)
+        cosr = 1 - 2*(x*x + y*y)
+        roll = math.atan2(sinr, cosr)
+        # pitch (y-axis)
+        sinp = 2*(w*y - z*x)
+        pitch = math.asin(clamp(sinp, -1, 1))
+        # yaw (z-axis)
+        siny = 2*(w*z + x*y)
+        cosy = 1 - 2*(y*y + z*z)
+        yaw = math.atan2(siny, cosy)
+        return roll, pitch, yaw
+
+    def rotmat(self):
+        # body->world rotation matrix from quaternion
+        w,x,y,z = self.q
+        R = np.array([
+            [1-2*(y*y+z*z), 2*(x*y - z*w), 2*(x*z + y*w)],
+            [2*(x*y + z*w), 1-2*(x*x+z*z), 2*(y*z - x*w)],
+            [2*(x*z - y*w), 2*(y*z + x*w), 1-2*(x*x+y*y)]
+        ], dtype=float)
+        return R
+
+# =========================
+#   GPS (NMEA) minimal
+# =========================
+_NMEA = re.compile(r"^\$(?P<body>[^*]+)\*(?P<chk>[0-9A-Fa-f]{2})$")
+
+def nmea_checksum(body: str) -> int:
+    x = 0
+    for c in body: x ^= ord(c)
+    return x
+
+def parse_nmea(line: str):
+    m = _NMEA.match(line.strip())
+    if not m:
+        return None, None
+    body = m["body"]
+    got = int(m["chk"], 16)
+    if nmea_checksum(body) != got:
+        return None, None
+    parts = body.split(",")
+    return parts[0], parts
+
+def latlon(v, hemi):
+    if not v or "." not in v: return None
+    d = 2 if hemi in ("N","S") else 3
+    deg = int(v[:d]); mins = float(v[d:])
+    out = deg + mins/60.0
+    return -out if hemi in ("S","W") else out
+
+class GPSReader:
+    def __init__(self, port=GPS_PORT, baud=GPS_BAUD):
+        self.ser = serial.Serial(port, baud, timeout=0.2)
+        self.last_fix = None  # dict with lat,lon,spd_kmh,cog_deg,utc,sats,hdop
+
+    def read_once(self):
+        line = self.ser.readline().decode("ascii", errors="ignore").strip()
+        if not line:
+            return None
+        kind, p = parse_nmea(line)
+        if not kind:
+            return None
+
+        # GGA: sats/hdop + fix
+        if kind.endswith("GGA"):
+            # p: time, lat, N/S, lon, E/W, fixQ, sats, hdop, alt...
+            fixQ = p[6] if len(p) > 6 else "0"
+            sats = int(p[7]) if len(p) > 7 and p[7] else 0
+            hdop = float(p[8]) if len(p) > 8 and p[8] else None
+            utc = p[1] if len(p) > 1 else None
+            if fixQ != "0":
+                lat = latlon(p[2], p[3])
+                lon = latlon(p[4], p[5])
+                self._update(lat=lat, lon=lon, sats=sats, hdop=hdop, utc=utc)
+
+        # RMC: speed/course + validity
+        if kind.endswith("RMC"):
+            # p: time, status(A/V), lat, N/S, lon, E/W, spd(knots), cog(deg), date...
+            utc = p[1] if len(p) > 1 else None
+            status = p[2] if len(p) > 2 else "V"
+            if status == "A":
+                lat = latlon(p[3], p[4])
+                lon = latlon(p[5], p[6])
+                spd_kmh = float(p[7]) * 1.852 if len(p) > 7 and p[7] else 0.0
+                cog = float(p[8]) if len(p) > 8 and p[8] else None
+                self._update(lat=lat, lon=lon, spd_kmh=spd_kmh, cog_deg=cog, utc=utc)
+
+        return self.last_fix
+
+    def _update(self, **kw):
+        if self.last_fix is None:
+            self.last_fix = {}
+        for k,v in kw.items():
+            if v is not None:
+                self.last_fix[k] = v
+
+# =========================
+#   Lat/Lon -> Local XY (meters)
+# =========================
+class LocalFrame:
+    def __init__(self):
+        self.lat0 = None
+        self.lon0 = None
+
+    def set_origin(self, lat, lon):
+        self.lat0 = lat
+        self.lon0 = lon
+
+    def ll_to_xy(self, lat, lon):
+        # Equirectangular approx (good for small areas)
+        R = 6378137.0
+        lat0 = math.radians(self.lat0)
+        x = math.radians(lon - self.lon0) * R * math.cos(lat0)
+        y = math.radians(lat - self.lat0) * R
+        return x, y
+
+# =========================
+#   EKF 2D: state [x,y,vx,vy,yaw]
+#   - predict from IMU accel (world frame) + gyro yaw-rate inside Madgwick
+#   - update from GPS position
+#   - optional update yaw from GPS course when speed is sufficient
+# =========================
+class EKF2D:
+    def __init__(self):
+        self.x = np.zeros((5,1))  # [x,y,vx,vy,yaw]
+        self.P = np.diag([10,10, 5,5, 0.5])**2
+
+        # Process noise (tune!)
+        self.q_pos = 0.05     # m
+        self.q_vel = 0.5      # m/s
+        self.q_yaw = 0.02     # rad
+
+        # Measurement noise (tune!)
+        self.r_gps = 3.0      # meters (typical consumer GPS)
+        self.r_cog = math.radians(10.0)  # course noise (deg->rad)
+
+    def predict(self, ax_w, ay_w, yaw, dt):
+        # state
+        x,y,vx,vy,psi = self.x.flatten()
+
+        # simple motion model
+        x  = x  + vx*dt + 0.5*ax_w*dt*dt
+        y  = y  + vy*dt + 0.5*ay_w*dt*dt
+        vx = vx + ax_w*dt
+        vy = vy + ay_w*dt
+        psi = yaw  # we trust Madgwick yaw as "state yaw" (will drift)
+
+        self.x = np.array([[x],[y],[vx],[vy],[psi]])
+
+        # Jacobian F
+        F = np.eye(5)
+        F[0,2] = dt
+        F[1,3] = dt
+
+        # Process noise Q
+        Q = np.diag([self.q_pos, self.q_pos, self.q_vel, self.q_vel, self.q_yaw])**2
+        self.P = F @ self.P @ F.T + Q
+
+    def update_gps_xy(self, x_gps, y_gps):
+        z = np.array([[x_gps],[y_gps]])
+        H = np.zeros((2,5))
+        H[0,0] = 1.0
+        H[1,1] = 1.0
+        R = np.diag([self.r_gps, self.r_gps])**2
+
+        y = z - (H @ self.x)
+        S = H @ self.P @ H.T + R
+        K = self.P @ H.T @ np.linalg.inv(S)
+        self.x = self.x + K @ y
+        self.P = (np.eye(5) - K @ H) @ self.P
+
+    def update_yaw_from_cog(self, cog_deg):
+        # Use GPS course as yaw measurement (only when moving reliably)
+        psi_meas = math.radians(cog_deg)
+        # normalize innovation to [-pi,pi]
+        psi = float(self.x[4,0])
+        d = (psi_meas - psi + math.pi) % (2*math.pi) - math.pi
+
+        H = np.zeros((1,5))
+        H[0,4] = 1.0
+        R = np.array([[self.r_cog**2]])
+        S = H @ self.P @ H.T + R
+        K = self.P @ H.T @ np.linalg.inv(S)
+        self.x = self.x + K * d
+        self.P = (np.eye(5) - K @ H) @ self.P
+
+# =========================
+#   Main loop
+# =========================
+def main():
+    bus = smbus.SMBus(I2C_BUS)
+    imu = MPU6050(bus)
+    imu.calibrate(seconds=3.0, hz=200)
+
+    ahrs = MadgwickIMU(beta=0.08)
+    gps = GPSReader(port=GPS_PORT, baud=GPS_BAUD)
+    frame = LocalFrame()
+    ekf = EKF2D()
+
+    print("\n[run] Starting. Waiting for first valid GPS fix to set local origin...")
+
+    # Wait for a GPS fix to set origin
+    while True:
+        fix = gps.read_once()
+        if fix and ("lat" in fix) and ("lon" in fix) and fix.get("sats",0) >= 4:
+            frame.set_origin(fix["lat"], fix["lon"])
+            x0,y0 = frame.ll_to_xy(fix["lat"], fix["lon"])
+            ekf.x[0,0] = x0
+            ekf.x[1,0] = y0
+            print(f"[gps] origin set: lat0={fix['lat']:.6f}, lon0={fix['lon']:.6f}  sats={fix.get('sats')}")
+            break
+        time.sleep(0.05)
+
+    last = time.time()
+    while True:
+        now = time.time()
+        dt = now - last
+        last = now
+        if dt <= 0 or dt > 0.2:
+            dt = 0.01
+
+        # ---- IMU read
+        acc_g, gyro_rads = imu.read()
+        ax, ay, az = acc_g  # in g
+        gx, gy, gz = gyro_rads  # rad/s
+
+        # Madgwick wants accel in "g" (normalized OK) and gyro rad/s
+        ahrs.update_imu(gx, gy, gz, ax, ay, az, dt)
+        roll, pitch, yaw = ahrs.euler()
+        R_bw = ahrs.rotmat()  # body->world
+
+        # Convert accel to m/s^2 in world and remove gravity
+        acc_ms2_body = np.array([ax, ay, az]) * 9.80665
+        acc_ms2_world = R_bw @ acc_ms2_body
+
+        # Remove gravity in world Z (approx)
+        ax_w = acc_ms2_world[0]
+        ay_w = acc_ms2_world[1]
+        # for ground robot you typically ignore z
+
+        # ---- EKF predict
+        ekf.predict(ax_w=ax_w, ay_w=ay_w, yaw=yaw, dt=dt)
+
+        # ---- GPS update (when new fix available)
+        fix = gps.read_once()
+        if fix and ("lat" in fix) and ("lon" in fix):
+            xg, yg = frame.ll_to_xy(fix["lat"], fix["lon"])
+            ekf.update_gps_xy(xg, yg)
+
+            # Optional yaw correction using course-over-ground (helps a LOT without mag)
+            spd = fix.get("spd_kmh", 0.0)
+            cog = fix.get("cog_deg", None)
+            if cog is not None and spd is not None and spd > 3.0:  # only if moving
+                ekf.update_yaw_from_cog(cog)
+
+        # ---- Print at ~10 Hz
+        if int(now*10) != int((now-dt)*10):
+            X = ekf.x.flatten()
+            print(
+                f"x={X[0]:8.2f} m  y={X[1]:8.2f} m  "
+                f"vx={X[2]:6.2f}  vy={X[3]:6.2f}  "
+                f"yaw={math.degrees(X[4]):7.2f} deg | "
+                f"rpy=({math.degrees(roll):6.1f},{math.degrees(pitch):6.1f},{math.degrees(yaw):6.1f})"
+            )
+
+if __name__ == "__main__":
+    main()
+
