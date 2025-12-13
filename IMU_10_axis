@@ -1,0 +1,134 @@
+#!/usr/bin/env python3
+import time
+import smbus
+
+BUS = smbus.SMBus(1)
+
+MPU_ADDR = 0x68
+HMC_ADDR = 0x1E
+MS_ADDR  = 0x77
+
+def twos_complement_16(v: int) -> int:
+    return v - 65536 if v & 0x8000 else v
+
+def read_i16(addr: int, reg: int) -> int:
+    hi = BUS.read_byte_data(addr, reg)
+    lo = BUS.read_byte_data(addr, reg + 1)
+    return twos_complement_16((hi << 8) | lo)
+
+# ---------- MPU6050 (Accel + Gyro) ----------
+def mpu_init():
+    # Wake up device (clear sleep bit)
+    BUS.write_byte_data(MPU_ADDR, 0x6B, 0x00)
+    # Gyro full scale ±250 dps (0x00)
+    BUS.write_byte_data(MPU_ADDR, 0x1B, 0x00)
+    # Accel full scale ±2g (0x00)
+    BUS.write_byte_data(MPU_ADDR, 0x1C, 0x00)
+
+def mpu_read():
+    ax = read_i16(MPU_ADDR, 0x3B)
+    ay = read_i16(MPU_ADDR, 0x3D)
+    az = read_i16(MPU_ADDR, 0x3F)
+    gx = read_i16(MPU_ADDR, 0x43)
+    gy = read_i16(MPU_ADDR, 0x45)
+    gz = read_i16(MPU_ADDR, 0x47)
+
+    # Convert to physical units (approx)
+    ax_g = ax / 16384.0
+    ay_g = ay / 16384.0
+    az_g = az / 16384.0
+    gx_dps = gx / 131.0
+    gy_dps = gy / 131.0
+    gz_dps = gz / 131.0
+
+    return ax_g, ay_g, az_g, gx_dps, gy_dps, gz_dps
+
+# ---------- HMC5883L (Magnetometer) ----------
+def hmc_init():
+    # Configuration Register A: 8-average, 15 Hz, normal
+    BUS.write_byte_data(HMC_ADDR, 0x00, 0x70)
+    # Configuration Register B: gain
+    BUS.write_byte_data(HMC_ADDR, 0x01, 0xA0)
+    # Mode Register: continuous measurement
+    BUS.write_byte_data(HMC_ADDR, 0x02, 0x00)
+
+def hmc_read():
+    # Data output registers start at 0x03: X_MSB, X_LSB, Z_MSB, Z_LSB, Y_MSB, Y_LSB
+    x = read_i16(HMC_ADDR, 0x03)
+    z = read_i16(HMC_ADDR, 0x05)
+    y = read_i16(HMC_ADDR, 0x07)
+    return x, y, z
+
+# ---------- MS5611 (Barometer) ----------
+def ms_reset():
+    BUS.write_byte(MS_ADDR, 0x1E)  # reset command
+    time.sleep(0.01)
+
+def ms_read_prom():
+    # Read calibration PROM C1..C6 (we ignore CRC for simplicity)
+    prom = []
+    for i in range(0, 8):
+        reg = 0xA0 + i * 2
+        hi = BUS.read_byte_data(MS_ADDR, reg)
+        lo = BUS.read_byte_data(MS_ADDR, reg + 1)
+        prom.append((hi << 8) | lo)
+    return prom  # prom[1..6] useful
+
+def ms_convert_and_read(cmd_convert: int, cmd_adc_read: int = 0x00) -> int:
+    BUS.write_byte(MS_ADDR, cmd_convert)
+    time.sleep(0.01)  # OSR=256/512/1024 need ~1-3ms; 10ms is safe
+    BUS.write_byte(MS_ADDR, 0x00)  # ADC read command
+    b1 = BUS.read_byte(MS_ADDR)
+    b2 = BUS.read_byte(MS_ADDR)
+    b3 = BUS.read_byte(MS_ADDR)
+    return (b1 << 16) | (b2 << 8) | b3
+
+def ms_read_pressure_temp():
+    # Using OSR=4096 for better stability:
+    # D1 (pressure) convert: 0x48, D2 (temp) convert: 0x58
+    D1 = ms_convert_and_read(0x48)
+    D2 = ms_convert_and_read(0x58)
+
+    # Calibration
+    prom = ms_read_prom()
+    C1 = prom[1]
+    C2 = prom[2]
+    C3 = prom[3]
+    C4 = prom[4]
+    C5 = prom[5]
+    C6 = prom[6]
+
+    dT = D2 - (C5 << 8)
+    TEMP = 2000 + (dT * C6) / (1 << 23)
+
+    OFF  = (C2 << 16) + (C4 * dT) / (1 << 7)
+    SENS = (C1 << 15) + (C3 * dT) / (1 << 8)
+
+    P = ((D1 * SENS) / (1 << 21) - OFF) / (1 << 15)
+
+    temp_c = TEMP / 100.0
+    pressure_mbar = P / 100.0
+    return temp_c, pressure_mbar
+
+def main():
+    print("Initializing sensors...")
+    mpu_init()
+    hmc_init()
+    ms_reset()
+    time.sleep(0.05)
+
+    while True:
+        ax, ay, az, gx, gy, gz = mpu_read()
+        mx, my, mz = hmc_read()
+        t_c, p_mbar = ms_read_pressure_temp()
+
+        print(
+            f"ACC[g]: ({ax:+.3f},{ay:+.3f},{az:+.3f})  "
+            f"GYRO[dps]: ({gx:+.2f},{gy:+.2f},{gz:+.2f})  "
+            f"MAG: ({mx:+d},{my:+d},{mz:+d})  "
+            f"BARO: {p_mbar:.2f} mbar  TEMP: {t_c:.2f} C"
+        )
+        time.sleep(0.2)
+
+if __name__ == "__main__":
+    main()
