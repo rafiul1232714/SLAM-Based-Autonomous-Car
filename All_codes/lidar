@@ -1,0 +1,24 @@
+from rplidar import RPLidar
+
+PORT = '/dev/tty.usbserial-0001'   # your lidar device
+
+lidar = RPLidar(PORT)
+
+try:
+    # info about the lidar
+    print(lidar.get_info())
+    print(lidar.get_health())
+
+    # start scanning
+    # for i, scan in enumerate(lidar.iter_scans()):
+    #     print('%d: Got %d measurments' % (i, len(scan)))
+    #     if i >= 10:
+    #         break
+
+    for new_scan, quality, angle, distance in lidar.iter_measurments():
+        print(f"{angle:.2f}°, {distance:.1f} mm (Q={quality})")
+
+finally:
+    lidar.stop()
+    lidar.stop_motor()
+    lidar.disconnect()
