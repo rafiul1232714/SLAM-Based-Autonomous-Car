@@ -1,0 +1,324 @@
+#!/usr/bin/env python3
+import time, math
+import numpy as np
+import smbus
+
+# =========================
+#   Hardware
+# =========================
+I2C_BUS = 1
+MPU_ADDR = 0x68
+MAG_ADDR = 0x1E  # HMC5883L (you confirmed 0x1E)
+
+G = 9.80665
+
+# =========================
+#   Helpers
+# =========================
+def twos16(v):
+    return v - 65536 if v & 0x8000 else v
+
+def clamp(x, a, b):
+    return a if x < a else b if x > b else x
+
+def wrap_pi(a):
+    return (a + math.pi) % (2 * math.pi) - math.pi
+
+# =========================
+#   MPU6050 (Accel+Gyro) + BYPASS for mag
+# =========================
+class MPU6050:
+    def __init__(self, bus, addr=MPU_ADDR):
+        self.bus = bus
+        self.addr = addr
+
+        # Wake up
+        self.bus.write_byte_data(self.addr, 0x6B, 0x00)
+        time.sleep(0.05)
+
+        # Gyro ±250 dps, Acc ±2g
+        self.bus.write_byte_data(self.addr, 0x1B, 0x00)
+        self.bus.write_byte_data(self.addr, 0x1C, 0x00)
+        time.sleep(0.01)
+
+        # Enable I2C bypass so HMC5883L @0x1E is visible on I2C bus
+        self.bus.write_byte_data(self.addr, 0x37, 0x02)  # INT_PIN_CFG: BYPASS_EN=1
+        self.bus.write_byte_data(self.addr, 0x6A, 0x00)  # USER_CTRL: I2C_MST_EN=0
+        time.sleep(0.01)
+
+        self.acc_lsb_per_g = 16384.0
+        self.gyro_lsb_per_dps = 131.0
+
+        self.gyro_bias_dps = np.zeros(3)
+        self.acc_bias_g = np.zeros(3)
+
+    def _read_i16(self, reg):
+        hi = self.bus.read_byte_data(self.addr, reg)
+        lo = self.bus.read_byte_data(self.addr, reg + 1)
+        return twos16((hi << 8) | lo)
+
+    def read(self):
+        ax = self._read_i16(0x3B)
+        ay = self._read_i16(0x3D)
+        az = self._read_i16(0x3F)
+        gx = self._read_i16(0x43)
+        gy = self._read_i16(0x45)
+        gz = self._read_i16(0x47)
+
+        acc_g = np.array([ax, ay, az], dtype=float) / self.acc_lsb_per_g
+        gyro_dps = np.array([gx, gy, gz], dtype=float) / self.gyro_lsb_per_dps
+
+        acc_g -= self.acc_bias_g
+        gyro_dps -= self.gyro_bias_dps
+
+        gyro_rads = np.deg2rad(gyro_dps)
+        return acc_g, gyro_rads
+
+    def calibrate(self, seconds=3.0, hz=200):
+        """
+        Keep IMU still and flat (Z up) during calibration.
+        """
+        n = int(seconds * hz)
+        acc_sum = np.zeros(3)
+        gyro_sum = np.zeros(3)
+        dt = 1.0 / hz
+
+        print(f"[cal] Hold IMU still for {seconds:.1f}s ...")
+        for _ in range(n):
+            acc_g, gyro_rads = self.read()
+            acc_sum += acc_g
+            gyro_sum += np.rad2deg(gyro_rads)
+            time.sleep(dt)
+
+        acc_mean = acc_sum / n
+        gyro_mean_dps = gyro_sum / n
+
+        self.gyro_bias_dps = gyro_mean_dps
+        self.acc_bias_g = np.array([acc_mean[0], acc_mean[1], acc_mean[2] - 1.0])
+
+        print("[cal] gyro_bias_dps:", self.gyro_bias_dps)
+        print("[cal] acc_bias_g:", self.acc_bias_g)
+
+# =========================
+#   HMC5883L Magnetometer (0x1E)
+# =========================
+class HMC5883L:
+    def __init__(self, bus, addr=MAG_ADDR):
+        self.bus = bus
+        self.addr = addr
+
+        # ID (often H 4 3)
+        try:
+            ida = self.bus.read_byte_data(self.addr, 0x0A)
+            idb = self.bus.read_byte_data(self.addr, 0x0B)
+            idc = self.bus.read_byte_data(self.addr, 0x0C)
+            print("[mag] ID:", chr(ida), chr(idb), chr(idc))
+        except Exception as e:
+            print("[mag] ID read failed (still may work):", e)
+
+        # Config A: 8avg, 15Hz, normal
+        self.bus.write_byte_data(self.addr, 0x00, 0x70)
+        # Config B: gain 1.3Ga
+        self.bus.write_byte_data(self.addr, 0x01, 0x20)
+        # Mode: continuous
+        self.bus.write_byte_data(self.addr, 0x02, 0x00)
+        time.sleep(0.01)
+
+        # hard-iron offsets (you should calibrate these later)
+        self.offset = np.zeros(3)
+
+        # axis alignment (change only if yaw looks wrong)
+        self.axis_map = np.array([0, 1, 2])
+        self.axis_sign = np.array([1, 1, 1])
+
+        print(f"[mag] HMC5883L ready at 0x{self.addr:02X}")
+
+    def read_raw(self):
+        data = self.bus.read_i2c_block_data(self.addr, 0x03, 6)
+        x = twos16((data[0] << 8) | data[1])
+        z = twos16((data[2] << 8) | data[3])
+        y = twos16((data[4] << 8) | data[5])
+        return np.array([x, y, z], dtype=float)
+
+    def read(self):
+        m = self.read_raw()
+        m = m - self.offset
+        m = m[self.axis_map] * self.axis_sign
+        return m
+
+# =========================
+#   Madgwick AHRS (gyro+acc+mag)
+# =========================
+class MadgwickAHRS:
+    def __init__(self, beta=0.08):
+        self.beta = beta
+        self.q = np.array([1.0, 0.0, 0.0, 0.0], dtype=float)  # [w,x,y,z]
+
+    def update(self, gx, gy, gz, ax, ay, az, mx, my, mz, dt):
+        # Normalize accel
+        norm = math.sqrt(ax*ax + ay*ay + az*az)
+        if norm < 1e-9:
+            return
+        ax, ay, az = ax/norm, ay/norm, az/norm
+
+        # Normalize mag
+        norm = math.sqrt(mx*mx + my*my + mz*mz)
+        if norm < 1e-9:
+            return
+        mx, my, mz = mx/norm, my/norm, mz/norm
+
+        q1, q2, q3, q4 = self.q
+
+        # Reference direction of Earth's field
+        hx = 2*mx*(0.5 - q3*q3 - q4*q4) + 2*my*(q2*q3 - q1*q4) + 2*mz*(q2*q4 + q1*q3)
+        hy = 2*mx*(q2*q3 + q1*q4) + 2*my*(0.5 - q2*q2 - q4*q4) + 2*mz*(q3*q4 - q1*q2)
+        bx = math.sqrt(hx*hx + hy*hy)
+        bz = 2*mx*(q2*q4 - q1*q3) + 2*my*(q3*q4 + q1*q2) + 2*mz*(0.5 - q2*q2 - q3*q3)
+
+        # Objective function
+        f1 = 2*(q2*q4 - q1*q3) - ax
+        f2 = 2*(q1*q2 + q3*q4) - ay
+        f3 = 2*(0.5 - q2*q2 - q3*q3) - az
+        f4 = 2*bx*(0.5 - q3*q3 - q4*q4) + 2*bz*(q2*q4 - q1*q3) - mx
+        f5 = 2*bx*(q2*q3 - q1*q4) + 2*bz*(q1*q2 + q3*q4) - my
+        f6 = 2*bx*(q1*q3 + q2*q4) + 2*bz*(0.5 - q2*q2 - q3*q3) - mz
+
+        # Gradient
+        s1 = (-2*q3)*f1 + (2*q2)*f2 + (-2*bz*q3)*f4 + (-2*bx*q4 + 2*bz*q2)*f5 + (2*bx*q3)*f6
+        s2 = (2*q4)*f1 + (2*q1)*f2 + (-4*q2)*f3 + (2*bz*q4)*f4 + (2*bx*q3 + 2*bz*q1)*f5 + (2*bx*q4 - 4*bz*q2)*f6
+        s3 = (-2*q1)*f1 + (2*q4)*f2 + (-4*q3)*f3 + (-4*bx*q3 - 2*bz*q1)*f4 + (2*bx*q2 + 2*bz*q4)*f5 + (2*bx*q1 - 4*bz*q3)*f6
+        s4 = (2*q2)*f1 + (2*q3)*f2 + (-2*bx*q4 + 2*bz*q2)*f4 + (-2*bx*q1 + 2*bz*q3)*f5 + (2*bx*q2)*f6
+
+        norm_s = math.sqrt(s1*s1 + s2*s2 + s3*s3 + s4*s4)
+        if norm_s > 1e-9:
+            s1, s2, s3, s4 = s1/norm_s, s2/norm_s, s3/norm_s, s4/norm_s
+
+        # Integrate quaternion rate
+        qDot1 = 0.5 * (-q2*gx - q3*gy - q4*gz) - self.beta*s1
+        qDot2 = 0.5 * ( q1*gx + q3*gz - q4*gy) - self.beta*s2
+        qDot3 = 0.5 * ( q1*gy - q2*gz + q4*gx) - self.beta*s3
+        qDot4 = 0.5 * ( q1*gz + q2*gy - q3*gx) - self.beta*s4
+
+        q1 += qDot1 * dt
+        q2 += qDot2 * dt
+        q3 += qDot3 * dt
+        q4 += qDot4 * dt
+
+        norm_q = math.sqrt(q1*q1 + q2*q2 + q3*q3 + q4*q4)
+        self.q = np.array([q1, q2, q3, q4]) / norm_q
+
+    def euler(self):
+        w, x, y, z = self.q
+        sinr = 2*(w*x + y*z)
+        cosr = 1 - 2*(x*x + y*y)
+        roll = math.atan2(sinr, cosr)
+
+        sinp = 2*(w*y - z*x)
+        pitch = math.asin(clamp(sinp, -1, 1))
+
+        siny = 2*(w*z + x*y)
+        cosy = 1 - 2*(y*y + z*z)
+        yaw = math.atan2(siny, cosy)
+        return roll, pitch, yaw
+
+    def rotmat(self):
+        w, x, y, z = self.q
+        return np.array([
+            [1-2*(y*y+z*z), 2*(x*y - z*w), 2*(x*z + y*w)],
+            [2*(x*y + z*w), 1-2*(x*x+z*z), 2*(y*z - x*w)],
+            [2*(x*z - y*w), 2*(y*z + x*w), 1-2*(x*x+y*y)]
+        ], dtype=float)
+
+# =========================
+#   EKF-like integrator (predict only)
+#   State: [x, y, vx, vy]
+# =========================
+class EKF2D_NoGPS:
+    def __init__(self):
+        self.x = np.zeros((4, 1))  # [x,y,vx,vy]
+        self.P = np.diag([1, 1, 1, 1])**2
+
+        # Process noise (tune)
+        self.q_pos = 0.10
+        self.q_vel = 0.50
+
+    def predict(self, ax_w, ay_w, dt):
+        x, y, vx, vy = self.x.flatten()
+
+        x  = x  + vx*dt + 0.5*ax_w*dt*dt
+        y  = y  + vy*dt + 0.5*ay_w*dt*dt
+        vx = vx + ax_w*dt
+        vy = vy + ay_w*dt
+
+        self.x = np.array([[x], [y], [vx], [vy]])
+
+        F = np.eye(4)
+        F[0, 2] = dt
+        F[1, 3] = dt
+
+        Q = np.diag([self.q_pos, self.q_pos, self.q_vel, self.q_vel])**2
+        self.P = F @ self.P @ F.T + Q
+
+# =========================
+#   Main
+# =========================
+def main():
+    bus = smbus.SMBus(I2C_BUS)
+
+    imu = MPU6050(bus)
+    imu.calibrate(seconds=3.0, hz=200)
+
+    mag = HMC5883L(bus, addr=MAG_ADDR)
+    ahrs = MadgwickAHRS(beta=0.08)
+
+    nav = EKF2D_NoGPS()
+
+    print("\n[run] GPS removed. Yaw comes from IMU+MAG only. Position is dead-reckoning (will drift).")
+
+    last = time.time()
+    while True:
+        now = time.time()
+        dt = now - last
+        last = now
+        if dt <= 0 or dt > 0.2:
+            dt = 0.01
+
+        # Read sensors
+        acc_g, gyro_rads = imu.read()
+        mx, my, mz = mag.read()
+
+        ax, ay, az = acc_g
+        gx, gy, gz = gyro_rads
+
+        # AHRS (yaw independent of GPS)
+        ahrs.update(gx, gy, gz, ax, ay, az, mx, my, mz, dt)
+        roll, pitch, yaw = ahrs.euler()
+        R_bw = ahrs.rotmat()  # body->world
+
+        # Convert accel to m/s^2 (body)
+        acc_ms2_body = np.array([ax, ay, az]) * G
+
+        # Gravity removal using estimated orientation:
+        # a_world = R*b_acc - g_world, where g_world = [0,0,G]
+        acc_ms2_world = R_bw @ acc_ms2_body
+        ax_w = acc_ms2_world[0]
+        ay_w = acc_ms2_world[1]
+        az_w = acc_ms2_world[2] - G  # remove gravity on world Z
+
+        # For a ground robot, we integrate only horizontal accel
+        # (az_w is shown for debug)
+        nav.predict(ax_w=ax_w, ay_w=ay_w, dt=dt)
+
+        # Print ~10 Hz
+        if int(now * 10) != int((now - dt) * 10):
+            X = nav.x.flatten()
+            print(
+                f"x={X[0]:8.2f} m  y={X[1]:8.2f} m  "
+                f"vx={X[2]:6.2f}  vy={X[3]:6.2f}  | "
+                f"yaw={math.degrees(yaw):7.2f} deg  "
+                f"rpy=({math.degrees(roll):6.1f},{math.degrees(pitch):6.1f},{math.degrees(yaw):6.1f})  "
+                f"az_w={az_w:6.2f}"
+            )
+
+if __name__ == "__main__":
+    main()
