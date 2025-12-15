@@ -1,1 +1,494 @@
+#!/usr/bin/env python3
+import time, math
+import numpy as np
+import smbus
+
+# LiDAR library
+# pip install rplidar-roboticia
+from rplidar import RPLidar
+
+# =========================
+#   CONFIG
+# =========================
+I2C_BUS = 1
+MPU_ADDR = 0x68
+MAG_ADDR = 0x1E  # HMC5883L (you confirmed 0x1E)
+G = 9.80665
+
+# LiDAR port on Raspberry Pi usually /dev/ttyUSB0 or /dev/ttyACM0
+LIDAR_PORT = "/dev/ttyUSB0"
+LIDAR_MIN_MM = 150      # ignore too-close points
+LIDAR_MAX_MM = 8000     # ignore too-far points
+LIDAR_MIN_Q  = 8        # ignore low quality
+SCAN_MIN_POINTS = 180   # minimum points per scan to run ICP
+DOWNSAMPLE_N = 250      # ICP speed vs robustness tradeoff
+
+# EKF measurement noise for LiDAR position correction (tune!)
+R_LIDAR_POS = 0.05  # meters (bigger => trust LiDAR less)
+
+# =========================
+#   Helpers
+# =========================
+def twos16(v):
+    return v - 65536 if v & 0x8000 else v
+
+def clamp(x, a, b):
+    return a if x < a else b if x > b else x
+
+def wrap_pi(a):
+    return (a + math.pi) % (2 * math.pi) - math.pi
+
+def rot2(theta):
+    c, s = math.cos(theta), math.sin(theta)
+    return np.array([[c, -s],
+                     [s,  c]], dtype=float)
+
+def polar_to_xy(angle_deg, dist_mm):
+    a = math.radians(angle_deg)
+    r = dist_mm / 1000.0
+    return r * math.cos(a), r * math.sin(a)
+
+def downsample_points(pts, n=DOWNSAMPLE_N):
+    if len(pts) <= n:
+        return pts
+    idx = np.random.choice(len(pts), n, replace=False)
+    return pts[idx]
+
+# =========================
+#   MPU6050 (Accel+Gyro) + BYPASS for mag
+# =========================
+class MPU6050:
+    def __init__(self, bus, addr=MPU_ADDR):
+        self.bus = bus
+        self.addr = addr
+
+        # Wake up
+        self.bus.write_byte_data(self.addr, 0x6B, 0x00)
+        time.sleep(0.05)
+
+        # Gyro ±250 dps, Acc ±2g
+        self.bus.write_byte_data(self.addr, 0x1B, 0x00)
+        self.bus.write_byte_data(self.addr, 0x1C, 0x00)
+        time.sleep(0.01)
+
+        # Enable I2C bypass so HMC5883L @0x1E is visible
+        self.bus.write_byte_data(self.addr, 0x37, 0x02)  # BYPASS_EN=1
+        self.bus.write_byte_data(self.addr, 0x6A, 0x00)  # disable I2C master
+        time.sleep(0.01)
+
+        self.acc_lsb_per_g = 16384.0
+        self.gyro_lsb_per_dps = 131.0
+        self.gyro_bias_dps = np.zeros(3)
+        self.acc_bias_g = np.zeros(3)
+
+    def _read_i16(self, reg):
+        hi = self.bus.read_byte_data(self.addr, reg)
+        lo = self.bus.read_byte_data(self.addr, reg + 1)
+        return twos16((hi << 8) | lo)
+
+    def read(self):
+        ax = self._read_i16(0x3B)
+        ay = self._read_i16(0x3D)
+        az = self._read_i16(0x3F)
+        gx = self._read_i16(0x43)
+        gy = self._read_i16(0x45)
+        gz = self._read_i16(0x47)
+
+        acc_g = np.array([ax, ay, az], dtype=float) / self.acc_lsb_per_g
+        gyro_dps = np.array([gx, gy, gz], dtype=float) / self.gyro_lsb_per_dps
+
+        acc_g -= self.acc_bias_g
+        gyro_dps -= self.gyro_bias_dps
+
+        gyro_rads = np.deg2rad(gyro_dps)
+        return acc_g, gyro_rads
+
+    def calibrate(self, seconds=3.0, hz=200):
+        n = int(seconds * hz)
+        acc_sum = np.zeros(3)
+        gyro_sum = np.zeros(3)
+        dt = 1.0 / hz
+
+        print(f"[cal] Hold IMU still for {seconds:.1f}s ...")
+        for _ in range(n):
+            acc_g, gyro_rads = self.read()
+            acc_sum += acc_g
+            gyro_sum += np.rad2deg(gyro_rads)
+            time.sleep(dt)
+
+        acc_mean = acc_sum / n
+        gyro_mean_dps = gyro_sum / n
+
+        self.gyro_bias_dps = gyro_mean_dps
+        self.acc_bias_g = np.array([acc_mean[0], acc_mean[1], acc_mean[2] - 1.0])
+
+        print("[cal] gyro_bias_dps:", self.gyro_bias_dps)
+        print("[cal] acc_bias_g:", self.acc_bias_g)
+
+# =========================
+#   HMC5883L Magnetometer (0x1E)
+# =========================
+class HMC5883L:
+    def __init__(self, bus, addr=MAG_ADDR):
+        self.bus = bus
+        self.addr = addr
+
+        try:
+            ida = self.bus.read_byte_data(self.addr, 0x0A)
+            idb = self.bus.read_byte_data(self.addr, 0x0B)
+            idc = self.bus.read_byte_data(self.addr, 0x0C)
+            print("[mag] ID:", chr(ida), chr(idb), chr(idc))
+        except Exception as e:
+            print("[mag] ID read failed (still may work):", e)
+
+        self.bus.write_byte_data(self.addr, 0x00, 0x70)  # 8avg, 15Hz
+        self.bus.write_byte_data(self.addr, 0x01, 0x20)  # gain
+        self.bus.write_byte_data(self.addr, 0x02, 0x00)  # continuous
+        time.sleep(0.01)
+
+        self.offset = np.zeros(3)  # calibrate later
+        self.axis_map = np.array([0, 1, 2])
+        self.axis_sign = np.array([1, 1, 1])
+
+        print(f"[mag] HMC5883L ready at 0x{self.addr:02X}")
+
+    def read_raw(self):
+        data = self.bus.read_i2c_block_data(self.addr, 0x03, 6)
+        x = twos16((data[0] << 8) | data[1])
+        z = twos16((data[2] << 8) | data[3])
+        y = twos16((data[4] << 8) | data[5])
+        return np.array([x, y, z], dtype=float)
+
+    def read(self):
+        m = self.read_raw()
+        m = (m - self.offset)
+        m = m[self.axis_map] * self.axis_sign
+        return m
+
+# =========================
+#   Madgwick AHRS (gyro+acc+mag)
+# =========================
+class MadgwickAHRS:
+    def __init__(self, beta=0.08):
+        self.beta = beta
+        self.q = np.array([1.0, 0.0, 0.0, 0.0], dtype=float)  # [w,x,y,z]
+
+    def update(self, gx, gy, gz, ax, ay, az, mx, my, mz, dt):
+        # Normalize accel
+        norm = math.sqrt(ax*ax + ay*ay + az*az)
+        if norm < 1e-9:
+            return
+        ax, ay, az = ax/norm, ay/norm, az/norm
+
+        # Normalize mag
+        norm = math.sqrt(mx*mx + my*my + mz*mz)
+        if norm < 1e-9:
+            return
+        mx, my, mz = mx/norm, my/norm, mz/norm
+
+        q1, q2, q3, q4 = self.q
+
+        hx = 2*mx*(0.5 - q3*q3 - q4*q4) + 2*my*(q2*q3 - q1*q4) + 2*mz*(q2*q4 + q1*q3)
+        hy = 2*mx*(q2*q3 + q1*q4) + 2*my*(0.5 - q2*q2 - q4*q4) + 2*mz*(q3*q4 - q1*q2)
+        bx = math.sqrt(hx*hx + hy*hy)
+        bz = 2*mx*(q2*q4 - q1*q3) + 2*my*(q3*q4 + q1*q2) + 2*mz*(0.5 - q2*q2 - q3*q3)
+
+        f1 = 2*(q2*q4 - q1*q3) - ax
+        f2 = 2*(q1*q2 + q3*q4) - ay
+        f3 = 2*(0.5 - q2*q2 - q3*q3) - az
+        f4 = 2*bx*(0.5 - q3*q3 - q4*q4) + 2*bz*(q2*q4 - q1*q3) - mx
+        f5 = 2*bx*(q2*q3 - q1*q4) + 2*bz*(q1*q2 + q3*q4) - my
+        f6 = 2*bx*(q1*q3 + q2*q4) + 2*bz*(0.5 - q2*q2 - q3*q3) - mz
+
+        s1 = (-2*q3)*f1 + (2*q2)*f2 + (-2*bz*q3)*f4 + (-2*bx*q4 + 2*bz*q2)*f5 + (2*bx*q3)*f6
+        s2 = (2*q4)*f1 + (2*q1)*f2 + (-4*q2)*f3 + (2*bz*q4)*f4 + (2*bx*q3 + 2*bz*q1)*f5 + (2*bx*q4 - 4*bz*q2)*f6
+        s3 = (-2*q1)*f1 + (2*q4)*f2 + (-4*q3)*f3 + (-4*bx*q3 - 2*bz*q1)*f4 + (2*bx*q2 + 2*bz*q4)*f5 + (2*bx*q1 - 4*bz*q3)*f6
+        s4 = (2*q2)*f1 + (2*q3)*f2 + (-2*bx*q4 + 2*bz*q2)*f4 + (-2*bx*q1 + 2*bz*q3)*f5 + (2*bx*q2)*f6
+
+        norm_s = math.sqrt(s1*s1 + s2*s2 + s3*s3 + s4*s4)
+        if norm_s > 1e-9:
+            s1, s2, s3, s4 = s1/norm_s, s2/norm_s, s3/norm_s, s4/norm_s
+
+        qDot1 = 0.5 * (-q2*gx - q3*gy - q4*gz) - self.beta*s1
+        qDot2 = 0.5 * ( q1*gx + q3*gz - q4*gy) - self.beta*s2
+        qDot3 = 0.5 * ( q1*gy - q2*gz + q4*gx) - self.beta*s3
+        qDot4 = 0.5 * ( q1*gz + q2*gy - q3*gx) - self.beta*s4
+
+        q1 += qDot1 * dt
+        q2 += qDot2 * dt
+        q3 += qDot3 * dt
+        q4 += qDot4 * dt
+
+        norm_q = math.sqrt(q1*q1 + q2*q2 + q3*q3 + q4*q4)
+        self.q = np.array([q1, q2, q3, q4]) / norm_q
+
+    def euler(self):
+        w, x, y, z = self.q
+        sinr = 2*(w*x + y*z)
+        cosr = 1 - 2*(x*x + y*y)
+        roll = math.atan2(sinr, cosr)
+
+        sinp = 2*(w*y - z*x)
+        pitch = math.asin(clamp(sinp, -1, 1))
+
+        siny = 2*(w*z + x*y)
+        cosy = 1 - 2*(y*y + z*z)
+        yaw = math.atan2(siny, cosy)
+        return roll, pitch, yaw
+
+    def rotmat(self):
+        w, x, y, z = self.q
+        return np.array([
+            [1-2*(y*y+z*z), 2*(x*y - z*w), 2*(x*z + y*w)],
+            [2*(x*y + z*w), 1-2*(x*x+z*z), 2*(y*z - x*w)],
+            [2*(x*z - y*w), 2*(y*z + x*w), 1-2*(x*x+y*y)]
+        ], dtype=float)
+
+# =========================
+#   EKF (x,y,vx,vy) + LiDAR position correction
+# =========================
+class EKF2D:
+    def __init__(self):
+        self.x = np.zeros((4, 1))  # [x,y,vx,vy]
+        self.P = np.diag([1.0, 1.0, 1.0, 1.0])**2
+
+        # process noise
+        self.q_pos = 0.10
+        self.q_vel = 0.50
+
+    def predict(self, ax_w, ay_w, dt):
+        x, y, vx, vy = self.x.flatten()
+
+        x  = x  + vx*dt + 0.5*ax_w*dt*dt
+        y  = y  + vy*dt + 0.5*ay_w*dt*dt
+        vx = vx + ax_w*dt
+        vy = vy + ay_w*dt
+
+        self.x = np.array([[x], [y], [vx], [vy]])
+
+        F = np.eye(4)
+        F[0, 2] = dt
+        F[1, 3] = dt
+
+        Q = np.diag([self.q_pos, self.q_pos, self.q_vel, self.q_vel])**2
+        self.P = F @ self.P @ F.T + Q
+
+    def update_lidar_xy(self, x_meas, y_meas, r_pos=R_LIDAR_POS):
+        z = np.array([[x_meas], [y_meas]])
+        H = np.zeros((2, 4))
+        H[0, 0] = 1.0
+        H[1, 1] = 1.0
+
+        R = np.diag([r_pos, r_pos])**2
+        y = z - (H @ self.x)
+        S = H @ self.P @ H.T + R
+        K = self.P @ H.T @ np.linalg.inv(S)
+
+        self.x = self.x + K @ y
+        self.P = (np.eye(4) - K @ H) @ self.P
+
+# =========================
+#   Lightweight 2D ICP (pure numpy)
+#   Returns dx,dy,dtheta that maps prev_pts -> curr_pts (in LiDAR frame)
+# =========================
+def icp_2d(prev_pts, curr_pts, iters=10, max_corr_dist=0.35):
+    # points: (N,2) in meters
+    src = prev_pts.copy()
+    dst = curr_pts.copy()
+
+    T = np.eye(3)
+
+    if len(src) < 50 or len(dst) < 50:
+        return 0.0, 0.0, 0.0, 0.0  # dx,dy,dtheta,fitness
+
+    # downsample for speed
+    src = downsample_points(src)
+    dst = downsample_points(dst)
+
+    # brute NN (OK for 250 points)
+    def nearest_neighbors(a, b):
+        # for each point in a, find closest in b
+        idx = []
+        d2s = []
+        for p in a:
+            d2 = np.sum((b - p)**2, axis=1)
+            j = int(np.argmin(d2))
+            idx.append(j)
+            d2s.append(d2[j])
+        return np.array(idx), np.array(d2s)
+
+    fitness = 0.0
+    for _ in range(iters):
+        idx, d2 = nearest_neighbors(src, dst)
+        dist = np.sqrt(d2)
+
+        mask = dist < max_corr_dist
+        if np.sum(mask) < 30:
+            break
+
+        A = src[mask]
+        B = dst[idx[mask]]
+
+        # compute best-fit 2D transform A->B using SVD
+        ca = A.mean(axis=0)
+        cb = B.mean(axis=0)
+        AA = A - ca
+        BB = B - cb
+
+        H = AA.T @ BB
+        U, _, Vt = np.linalg.svd(H)
+        R = Vt.T @ U.T
+        if np.linalg.det(R) < 0:
+            Vt[1, :] *= -1
+            R = Vt.T @ U.T
+
+        t = cb - R @ ca
+
+        # apply to src
+        src = (R @ src.T).T + t
+
+        # accumulate into T
+        Ti = np.eye(3)
+        Ti[:2, :2] = R
+        Ti[:2,  2] = t
+        T = Ti @ T
+
+        fitness = float(np.mean(dist[mask]))
+
+    dx = T[0, 2]
+    dy = T[1, 2]
+    dtheta = math.atan2(T[1, 0], T[0, 0])
+    return dx, dy, dtheta, fitness
+
+# =========================
+#   LiDAR scan collector (builds full 360 scan as XY)
+# =========================
+class LidarScanBuffer:
+    def __init__(self):
+        self.pts = []
+
+    def add_measurement(self, quality, angle, distance_mm):
+        if quality < LIDAR_MIN_Q:
+            return
+        if distance_mm <= 0:
+            return
+        if distance_mm < LIDAR_MIN_MM or distance_mm > LIDAR_MAX_MM:
+            return
+        x, y = polar_to_xy(angle, distance_mm)
+        self.pts.append([x, y])
+
+    def get_scan(self):
+        if len(self.pts) < SCAN_MIN_POINTS:
+            return None
+        pts = np.array(self.pts, dtype=float)
+        self.pts = []
+        return pts
+
+# =========================
+#   Main
+# =========================
+def main():
+    # --- IMU + MAG
+    bus = smbus.SMBus(I2C_BUS)
+    imu = MPU6050(bus)
+    imu.calibrate(seconds=3.0, hz=200)
+    mag = HMC5883L(bus, addr=MAG_ADDR)
+    ahrs = MadgwickAHRS(beta=0.08)
+
+    # --- EKF
+    ekf = EKF2D()
+
+    # --- LiDAR
+    lidar = RPLidar(LIDAR_PORT)
+    print("[lidar] info:", lidar.get_info())
+    print("[lidar] health:", lidar.get_health())
+
+    buf = LidarScanBuffer()
+    prev_scan = None
+
+    print("\n[run] IMU yaw from Madgwick. EKF predicts with accel. LiDAR ICP corrects x,y (drift reduction).")
+    print("[run] Ctrl+C to stop.\n")
+
+    last = time.time()
+    last_print = 0.0
+
+    try:
+        for new_scan, quality, angle, distance in lidar.iter_measurments():
+            # --- time step
+            now = time.time()
+            dt = now - last
+            last = now
+            if dt <= 0 or dt > 0.2:
+                dt = 0.01
+
+            # --- IMU update (fast, every lidar measurement loop)
+            acc_g, gyro_rads = imu.read()
+            mx, my, mz = mag.read()
+
+            ax, ay, az = acc_g
+            gx, gy, gz = gyro_rads
+
+            ahrs.update(gx, gy, gz, ax, ay, az, mx, my, mz, dt)
+            roll, pitch, yaw = ahrs.euler()
+            R_bw = ahrs.rotmat()
+
+            # body accel -> world accel, remove gravity
+            acc_ms2_body = np.array([ax, ay, az]) * G
+            acc_ms2_world = R_bw @ acc_ms2_body
+            ax_w = acc_ms2_world[0]
+            ay_w = acc_ms2_world[1]
+            az_w = acc_ms2_world[2] - G
+
+            # EKF predict (will drift without correction)
+            ekf.predict(ax_w=ax_w, ay_w=ay_w, dt=dt)
+
+            # --- LiDAR collect
+            buf.add_measurement(quality, angle, distance)
+
+            # when new_scan starts, previous scan is complete -> process buffer
+            if new_scan:
+                curr_scan = buf.get_scan()
+                if curr_scan is not None:
+                    if prev_scan is not None:
+                        dx, dy, dth, fit = icp_2d(prev_scan, curr_scan, iters=8, max_corr_dist=0.40)
+
+                        # Convert LiDAR-frame delta to WORLD-frame delta using IMU yaw
+                        # (assumes LiDAR rigidly mounted to robot)
+                        d_world = rot2(yaw) @ np.array([dx, dy], dtype=float)
+
+                        # Use this as a position measurement: x_meas = x + d_world
+                        x_pred = float(ekf.x[0, 0])
+                        y_pred = float(ekf.x[1, 0])
+                        x_meas = x_pred + d_world[0]
+                        y_meas = y_pred + d_world[1]
+
+                        ekf.update_lidar_xy(x_meas, y_meas, r_pos=R_LIDAR_POS)
+
+                    prev_scan = curr_scan
+
+            # --- print ~10 Hz
+            if now - last_print > 0.10:
+                last_print = now
+                X = ekf.x.flatten()
+                print(
+                    f"x={X[0]:8.2f}  y={X[1]:8.2f}  "
+                    f"vx={X[2]:6.2f}  vy={X[3]:6.2f}  | "
+                    f"yaw={math.degrees(yaw):7.2f} deg  "
+                    f"rpy=({math.degrees(roll):5.1f},{math.degrees(pitch):5.1f},{math.degrees(yaw):5.1f})  "
+                    f"az_w={az_w:6.2f}"
+                )
+
+    except KeyboardInterrupt:
+        print("\n[run] Stopping...")
+
+    finally:
+        try:
+            lidar.stop()
+            lidar.stop_motor()
+            lidar.disconnect()
+        except Exception:
+            pass
+
+if __name__ == "__main__":
+    main()
 
