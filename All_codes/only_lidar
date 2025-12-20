@@ -1,0 +1,23 @@
+from rplidar import RPLidar
+
+PORT = "/dev/ttyUSB0"
+lidar = RPLidar(PORT)
+
+print("Connected!")
+print("Info:", lidar.get_info())
+print("Health:", lidar.get_health())
+
+count = 0
+for m in lidar.iter_measures():   # <-- correct for your version
+    quality = m[0]
+    angle = m[2]
+    distance = m[3]
+    print(f"angle={angle:7.2f} deg  distance={distance:8.1f} mm  quality={quality}")
+    count += 1
+    if count >= 50:
+        break
+
+lidar.stop()
+lidar.disconnect()
+print("Done.")
+
