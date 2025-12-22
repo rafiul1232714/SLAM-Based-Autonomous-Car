@@ -1,0 +1,35 @@
+/*
+TT Motor clamp - print 2 copies
+Screws into the 4 posts on each motor cradle.
+Use M3 screws (self-tapping into pilot holes).
+*/
+
+$fn = 90;
+
+// must match bottom plate parameters
+motor_body_w = 24.0;
+clamp_post_dx = (motor_body_w/2) + 6;
+clamp_post_dy = 13;
+
+m3_clear = 3.2;
+
+clamp_x = (2*clamp_post_dx) + 10;
+clamp_y = (2*clamp_post_dy) + 12;
+clamp_t = 4;
+
+difference(){
+  // clamp plate
+  linear_extrude(height=clamp_t)
+    offset(r=2)
+      square([clamp_x-4, clamp_y-4], center=true);
+
+  // 4 screw holes
+  for (sx=[-1,1], sy=[-1,1])
+    translate([sx*clamp_post_dx, sy*clamp_post_dy, -0.1])
+      cylinder(d=m3_clear, h=clamp_t+0.2);
+
+  // underside relief (so it presses motor body, not walls)
+  translate([0,0, clamp_t-2.0])
+    linear_extrude(height=2.1)
+      square([motor_body_w+3, 30], center=true);
+}
