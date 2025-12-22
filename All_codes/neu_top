@@ -1,0 +1,179 @@
+/*
+TOP PLATE v10 - RPLIDAR A1M8 asymmetric legs + thick/tall collars
++ 4 screw holes + Raspberry Pi cable management (FIXED: no interference with collars)
+
+Fix:
+- Removed diagonal routing slots that were cutting through the LiDAR collar area
+- Added a right-side "cable corridor": vertical routing slot + tie slots near Pi zone
+*/
+
+$fn = 140;
+
+// ---------------- Plate ----------------
+plate_x = 160;
+plate_y = 140;
+plate_t = 4;
+corner_r = 6;
+
+// ---------------- Common holes ----------------
+m3_clear = 3.2;
+center_hole_d = 20;
+
+// ---------------- LiDAR LEG DATA ----------------
+leg_d = 6.0;         // typical ~6mm (measure if possible)
+leg_clear = 0.7;     // print clearance
+
+leg_pocket_d     = leg_d + leg_clear;
+leg_pocket_depth = 2.0;
+
+lead_in_d     = leg_pocket_d + 3.0;
+lead_in_depth = 0.8;
+
+// Thick/tall collar wall
+collar_wall_t    = 4.5;
+collar_h         = 8.0;
+collar_clearance = 0.7;
+
+// Asymmetric leg coordinates (mm), LiDAR center at (0,0)
+lidar_legs = [
+  [-19,  17],  // front-left
+  [ 19,  17],  // front-right
+  [-22, -17],  // back-left
+  [ 22, -17]   // back-right
+];
+
+// 4 LiDAR screw holes (use M3 unless your bracket uses M2.5)
+lidar_screw_d = 3.2;
+
+// ---------------- IMU (GY-87) ----------------
+imu_hole_d   = 2.2;  // M2 clearance
+imu_hole_off = 8;    // ±8 => 16x16 square
+
+// ---------------- Raspberry Pi cable management (SAFE ZONE on right) ----------------
+// You are taping Pi, so we only provide cable slots & tie-downs.
+
+// Zip-tie slots near where Pi sits (right-rear area)
+pi_zone = [55, -40];     // where you plan to tape Pi
+tie_slot_len = 18;
+tie_slot_w   = 4;
+tie_slot_gap = 18;
+
+// Right-side cable corridor (vertical slot) for routing wires
+corridor_x = 55;         // x position of cable corridor (right side)
+corridor_len = 70;       // long slot length
+corridor_w   = 7;        // width
+
+// Strain relief slot near corridor (anchor a zip tie here)
+strain_x = 55;
+strain_y = -5;
+strain_len = 16;
+strain_w   = 5;
+
+// Optional center slots (kept, but not touching collars)
+enable_center_slots = true;
+center_slot_len = 12;
+center_slot_w   = 6;
+
+// ---------------- Helpers ----------------
+module rounded_plate(x, y, t, r){
+  linear_extrude(height=t)
+    offset(r=r)
+      square([x-2*r, y-2*r], center=true);
+}
+module hole(d,h){ cylinder(d=d,h=h,center=false); }
+module slot_2d(len, wid){
+  hull(){
+    translate([-(len/2 - wid/2),0]) circle(d=wid);
+    translate([ +(len/2 - wid/2),0]) circle(d=wid);
+  }
+}
+
+// Full collar ring at leg position
+module collar_at(x,y){
+  collar_id = leg_pocket_d + 2*collar_clearance;
+  collar_od = collar_id + 2*collar_wall_t;
+
+  translate([x,y,plate_t])
+  difference(){
+    cylinder(d=collar_od, h=collar_h);
+    translate([0,0,-0.1]) cylinder(d=collar_id, h=collar_h+0.2);
+  }
+}
+
+// ---------------- Build ----------------
+difference(){
+  union(){
+    // Base plate
+    rounded_plate(plate_x, plate_y, plate_t, corner_r);
+
+    // Collars
+    for(p = lidar_legs)
+      collar_at(p[0], p[1]);
+  }
+
+  // Corner M3 holes (±70, ±60)
+  for (sx=[-70,70], sy=[-60,60])
+    translate([sx, sy, -0.1]) hole(m3_clear, plate_t+0.2);
+
+  // Center cable hole
+  translate([0,0,-0.1]) hole(center_hole_d, plate_t+0.2);
+
+  // LiDAR leg pockets + lead-in
+  for(p = lidar_legs){
+    x = p[0]; y = p[1];
+
+    translate([x,y, plate_t - lead_in_depth])
+      hole(lead_in_d, lead_in_depth+0.2);
+
+    translate([x,y, plate_t - leg_pocket_depth])
+      hole(leg_pocket_d, leg_pocket_depth+0.2);
+  }
+
+  // 4 LiDAR screw holes (through)
+  for(p = lidar_legs){
+    translate([p[0], p[1], -0.1])
+      hole(lidar_screw_d, plate_t+0.2);
+  }
+
+  // IMU holes at exact center
+  imu_pts = [
+    [ imu_hole_off,  imu_hole_off],
+    [-imu_hole_off,  imu_hole_off],
+    [-imu_hole_off, -imu_hole_off],
+    [ imu_hole_off, -imu_hole_off]
+  ];
+  for(pt = imu_pts)
+    translate([pt[0], pt[1], -0.1]) hole(imu_hole_d, plate_t+0.2);
+
+  // ---------------- PI CABLE MANAGEMENT (FIXED) ----------------
+  // Two zip-tie slots near Pi zone
+  translate([pi_zone[0], pi_zone[1] + tie_slot_gap/2, -0.1])
+    linear_extrude(height=plate_t+0.2)
+      slot_2d(tie_slot_len, tie_slot_w);
+
+  translate([pi_zone[0], pi_zone[1] - tie_slot_gap/2, -0.1])
+    linear_extrude(height=plate_t+0.2)
+      slot_2d(tie_slot_len, tie_slot_w);
+
+  // Right-side cable corridor (vertical long slot) - DOES NOT cross collars
+  translate([corridor_x, 0, -0.1])
+    rotate([0,0,90])                       // rotate slot so it's vertical in Y
+      linear_extrude(height=plate_t+0.2)
+        slot_2d(corridor_len, corridor_w);
+
+  // Strain relief slot near corridor
+  translate([strain_x, strain_y, -0.1])
+    linear_extrude(height=plate_t+0.2)
+      slot_2d(strain_len, strain_w);
+
+  // Optional center slots (kept small and away from collars)
+  if(enable_center_slots){
+    translate([0, -25, -0.1])
+      linear_extrude(height=plate_t+0.2)
+        slot_2d(center_slot_len, center_slot_w);
+
+    translate([0, +25, -0.1])
+      linear_extrude(height=plate_t+0.2)
+        slot_2d(center_slot_len, center_slot_w);
+  }
+}
