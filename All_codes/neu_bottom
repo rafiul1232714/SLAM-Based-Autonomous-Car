@@ -1,0 +1,212 @@
+/*
+BOTTOM PLATE v1 - Differential drive SLAM chassis
+- Plate: 160x140x4 mm
+- Corner M3 holes at (±70, ±60)
+- NEW: corner alignment bosses (lock mechanism with top plate)
+- 2x TT (yellow) motor cradle + clamp posts (no zip ties)
+- Caster mount holes front center
+- L298N mounting slots
+- Battery strap slots
+- Buck module strap slots
+- Switch cutout
+
+EXPORT:
+F6 -> Export STL
+Then print motor clamp separately (file 2).
+*/
+
+$fn = 90;
+
+// ---------------- Plate ----------------
+plate_x = 160;
+plate_y = 140;
+plate_t = 4;
+corner_r = 6;
+
+// ---------------- Common holes ----------------
+m3_clear = 3.2;
+m3_pilot = 2.7;     // pilot for self-tapping M3 into printed posts
+
+corner_holes = [[70,60],[70,-60],[-70,60],[-70,-60]];
+
+// ---------------- Lock mechanism (bosses) ----------------
+// These bosses help the top and bottom plates "lock" and self-align.
+// Boss OD should be <= 10mm so it doesn't interfere with screws.
+boss_od = 10;
+boss_h  = 2.0;   // height above bottom plate
+
+// ---------------- TT Motor Mount ----------------
+// Motor bay centers
+motor_centers = [[-60,0],[60,0]];
+
+// Adjust if needed for your TT motor body
+motor_body_len = 56;     // along Y
+motor_body_w   = 24.0;   // along X
+
+cradle_pocket_depth = 2.2;
+
+side_wall_t = 3;
+side_wall_h = 12;
+
+end_stop_t = 3;
+end_stop_h = 12;
+
+// Clamp posts (4 posts per motor)
+clamp_post_dx = (motor_body_w/2) + 6; // outside motor
+clamp_post_dy = 13;
+clamp_post_d  = 10;
+clamp_post_h  = 10;
+
+// ---------------- Wheel clearance ----------------
+enable_wheel_cutouts = true;
+wheel_clear_r = 34; // good for ~65-70mm wheels
+wheel_clear_centers = [[-80,0],[80,0]];
+
+// ---------------- Caster ----------------
+caster_y  = 60;
+caster_dx = 6.75; // 13.5mm spacing / 2
+
+// ---------------- Electronics mounts ----------------
+// L298N slotted mounts (universal-ish)
+slot_len = 12;
+slot_w   = 3.5;
+
+l298_center = [-35, -35];
+l298_dx = 35;   // half spacing X
+l298_dy = 17.5; // half spacing Y
+
+// Battery strap slots
+battery_slots = [[40,-45],[40,-20]];
+battery_slot_len = 55;
+battery_slot_w   = 6;
+
+// Buck strap slots
+buck_slots = [[40,25],[40,38]];
+buck_slot_len = 30;
+buck_slot_w   = 6;
+
+// Switch cutout on right edge
+switch_center = [80,-10];
+switch_x = 14;
+switch_y = 8;
+
+// ---------------- Helpers ----------------
+module rounded_plate(x, y, t, r){
+  linear_extrude(height=t)
+    offset(r=r)
+      square([x-2*r, y-2*r], center=true);
+}
+module hole(d, h){ cylinder(d=d, h=h, center=false); }
+module slot_2d(len, wid){
+  hull(){
+    translate([-(len/2 - wid/2),0]) circle(d=wid);
+    translate([ +(len/2 - wid/2),0]) circle(d=wid);
+  }
+}
+module rect_2d(x,y){ square([x,y], center=true); }
+
+// ---------------- Motor cradle geometry ----------------
+module motor_cradle(cx, cy){
+  // shallow pocket
+  translate([cx, cy, plate_t - cradle_pocket_depth])
+    linear_extrude(height=cradle_pocket_depth+0.2)
+      rect_2d(motor_body_w+1.2, motor_body_len+1.2);
+
+  // side walls (stop rotation)
+  translate([cx - (motor_body_w/2 + side_wall_t/2), cy, plate_t])
+    linear_extrude(height=side_wall_h)
+      rect_2d(side_wall_t, motor_body_len+6);
+
+  translate([cx + (motor_body_w/2 + side_wall_t/2), cy, plate_t])
+    linear_extrude(height=side_wall_h)
+      rect_2d(side_wall_t, motor_body_len+6);
+
+  // end stops (stop sliding)
+  translate([cx, cy + (motor_body_len/2 + end_stop_t/2), plate_t])
+    linear_extrude(height=end_stop_h)
+      rect_2d(motor_body_w+2*side_wall_t, end_stop_t);
+
+  translate([cx, cy - (motor_body_len/2 + end_stop_t/2), plate_t])
+    linear_extrude(height=end_stop_h)
+      rect_2d(motor_body_w+2*side_wall_t, end_stop_t);
+
+  // clamp posts (4)
+  for (sx=[-1,1], sy=[-1,1]){
+    px = cx + sx*clamp_post_dx;
+    py = cy + sy*clamp_post_dy;
+
+    // post body
+    translate([px, py, plate_t])
+      cylinder(d=clamp_post_d, h=clamp_post_h);
+  }
+}
+
+// ---------------- Main build ----------------
+difference(){
+  union(){
+    // base plate
+    rounded_plate(plate_x, plate_y, plate_t, corner_r);
+
+    // corner alignment bosses (lock feature)
+    for(p = corner_holes){
+      translate([p[0], p[1], plate_t])
+        cylinder(d=boss_od, h=boss_h);
+    }
+
+    // motor cradles
+    for(mc = motor_centers)
+      motor_cradle(mc[0], mc[1]);
+  }
+
+  // corner M3 through holes
+  for(p = corner_holes)
+    translate([p[0], p[1], -0.1]) hole(m3_clear, plate_t + boss_h + 0.2);
+
+  // pilot holes inside clamp posts (self tapping M3)
+  for (mc = motor_centers)
+    for (sx=[-1,1], sy=[-1,1]){
+      px = mc[0] + sx*clamp_post_dx;
+      py = mc[1] + sy*clamp_post_dy;
+      translate([px, py, plate_t-0.1])
+        cylinder(d=m3_pilot, h=clamp_post_h+0.2);
+    }
+
+  // wheel clearance cutouts (optional)
+  if(enable_wheel_cutouts)
+    for(wc = wheel_clear_centers)
+      translate([wc[0], wc[1], -0.1])
+        cylinder(r=wheel_clear_r, h=plate_t+0.2);
+
+  // caster mount holes (M3)
+  for (sx=[-caster_dx, caster_dx])
+    translate([sx, caster_y, -0.1]) hole(m3_clear, plate_t+0.2);
+
+  // L298N slotted mounts (4 slots)
+  l298_pts = [
+    [l298_center[0]-l298_dx, l298_center[1]-l298_dy],
+    [l298_center[0]-l298_dx, l298_center[1]+l298_dy],
+    [l298_center[0]+l298_dx, l298_center[1]-l298_dy],
+    [l298_center[0]+l298_dx, l298_center[1]+l298_dy]
+  ];
+  for(p=l298_pts)
+    translate([p[0],p[1],-0.1])
+      linear_extrude(height=plate_t+0.2)
+        slot_2d(slot_len, slot_w);
+
+  // battery strap slots
+  for(p=battery_slots)
+    translate([p[0],p[1],-0.1])
+      linear_extrude(height=plate_t+0.2)
+        slot_2d(battery_slot_len, battery_slot_w);
+
+  // buck strap slots
+  for(p=buck_slots)
+    translate([p[0],p[1],-0.1])
+      linear_extrude(height=plate_t+0.2)
+        slot_2d(buck_slot_len, buck_slot_w);
+
+  // switch cutout
+  translate([switch_center[0], switch_center[1], -0.1])
+    linear_extrude(height=plate_t+0.2)
+      rect_2d(switch_x, switch_y);
+}
