@@ -1,0 +1,461 @@
+#!/usr/bin/env python3
+"""
+LiDAR + IMU EKF Sensor Fusion (2D) for Raspberry Pi
+Hardware:
+- RPLIDAR A1 (serial)
+- GY-87 (MPU6050 gyro Z for yaw-rate)
+
+EKF state: [x, y, vx, vy, yaw]
+Measurements from LiDAR ICP: [x, y, vx, vy, yaw]
+Prediction uses IMU yaw-rate.
+
+Output:
+- Prints time, x, y, vx, vy, yaw
+- Saves CSV: ekf_fusion_log.csv
+"""
+
+import time
+import math
+import csv
+import threading
+from typing import Optional, Tuple
+
+import numpy as np
+from smbus2 import SMBus
+from rplidar import RPLidar
+
+
+# =========================
+# CONFIG
+# =========================
+
+# LiDAR
+LIDAR_PORT = "/dev/ttyUSB0"
+LIDAR_BAUD = 115200
+
+# IMU (MPU6050 on GY-87)
+I2C_BUS = 1
+MPU6050_ADDR = 0x68
+
+# Logging
+LOG_CSV_PATH = "ekf_fusion_log.csv"
+PRINT_HZ = 20  # print/log rate
+
+# LiDAR point filtering
+LIDAR_MIN_RANGE_M = 0.15
+LIDAR_MAX_RANGE_M = 6.0
+LIDAR_DOWNSAMPLE_STEP = 2      # keep every Nth point
+LIDAR_MAX_POINTS = 900
+
+# ICP parameters (tune if needed)
+ICP_MAX_ITERS = 18
+ICP_MAX_CORR_DIST = 0.50       # meters (increase if ICP often fails)
+ICP_MIN_MATCHES = 60
+ICP_CONVERGE_T = 1e-4
+
+# EKF tuning (very important)
+# Process noise (model uncertainty)
+Q_XY = 2e-3
+Q_V = 2e-2
+Q_YAW = 3e-3
+
+# Measurement noise (LiDAR ICP uncertainty)
+R_XY = 2e-2
+R_V = 8e-2
+R_YAW = 2e-2
+
+
+# =========================
+# UTILS
+# =========================
+
+def wrap_pi(a: float) -> float:
+    while a > math.pi:
+        a -= 2.0 * math.pi
+    while a < -math.pi:
+        a += 2.0 * math.pi
+    return a
+
+def rot2d(yaw: float) -> np.ndarray:
+    c = math.cos(yaw)
+    s = math.sin(yaw)
+    return np.array([[c, -s],
+                     [s,  c]], dtype=float)
+
+def now_s() -> float:
+    # monotonic for stable dt
+    return time.monotonic()
+
+
+# =========================
+# EKF
+# =========================
+
+class EKF2D:
+    """
+    State: x = [px, py, vx, vy, yaw]^T
+    Predict:
+      px += vx*dt
+      py += vy*dt
+      yaw += yaw_rate_imu*dt
+    Update (LiDAR):
+      z = [px, py, vx, vy, yaw]^T
+    """
+    def __init__(self):
+        self.x = np.zeros((5, 1), dtype=float)
+        self.P = np.eye(5, dtype=float) * 0.2
+
+        self.Q = np.diag([Q_XY, Q_XY, Q_V, Q_V, Q_YAW]).astype(float)
+        self.R = np.diag([R_XY, R_XY, R_V, R_V, R_YAW]).astype(float)
+
+        self._lock = threading.Lock()
+
+    def predict(self, dt: float, yaw_rate_imu: float):
+        if dt <= 0:
+            return
+        with self._lock:
+            px, py, vx, vy, yaw = self.x.flatten()
+
+            px = px + vx * dt
+            py = py + vy * dt
+            yaw = wrap_pi(yaw + yaw_rate_imu * dt)
+
+            self.x = np.array([[px], [py], [vx], [vy], [yaw]], dtype=float)
+
+            # Jacobian F
+            F = np.eye(5, dtype=float)
+            F[0, 2] = dt
+            F[1, 3] = dt
+            # yaw row already 1
+
+            self.P = F @ self.P @ F.T + self.Q
+
+    def update_lidar(self, z: np.ndarray):
+        """
+        z = [px, py, vx, vy, yaw]
+        """
+        with self._lock:
+            z = z.reshape((5, 1)).astype(float)
+
+            # Measurement model h(x) = x (identity)
+            H = np.eye(5, dtype=float)
+
+            y = z - self.x
+            y[4, 0] = wrap_pi(y[4, 0])  # yaw innovation wrapped
+
+            S = H @ self.P @ H.T + self.R
+            K = self.P @ H.T @ np.linalg.inv(S)
+
+            self.x = self.x + K @ y
+            self.x[4, 0] = wrap_pi(self.x[4, 0])
+
+            I = np.eye(5, dtype=float)
+            self.P = (I - K @ H) @ self.P
+
+    def get_state(self) -> Tuple[float, float, float, float, float]:
+        with self._lock:
+            px, py, vx, vy, yaw = self.x.flatten()
+            return float(px), float(py), float(vx), float(vy), float(yaw)
+
+
+# =========================
+# IMU (MPU6050 gyro Z)
+# =========================
+
+class MPU6050:
+    PWR_MGMT_1 = 0x6B
+    GYRO_CONFIG = 0x1B
+    GYRO_ZOUT_H = 0x47
+
+    def __init__(self, bus: int, addr: int):
+        self.bus = SMBus(bus)
+        self.addr = addr
+
+        # Wake
+        self.bus.write_byte_data(self.addr, self.PWR_MGMT_1, 0x00)
+
+        # Gyro full-scale ±250 deg/s
+        self.bus.write_byte_data(self.addr, self.GYRO_CONFIG, 0x00)
+        self.scale = 131.0  # LSB/(deg/s) for ±250
+
+        self.bias_dps = 0.0
+
+    def _read_i16(self, reg_h: int) -> int:
+        hi = self.bus.read_byte_data(self.addr, reg_h)
+        lo = self.bus.read_byte_data(self.addr, reg_h + 1)
+        v = (hi << 8) | lo
+        if v >= 0x8000:
+            v = -((65535 - v) + 1)
+        return v
+
+    def read_gyro_z_dps(self) -> float:
+        raw = self._read_i16(self.GYRO_ZOUT_H)
+        return (raw / self.scale) - self.bias_dps
+
+    def calibrate_bias(self, seconds: float = 2.0, rate_hz: float = 200.0):
+        n = int(seconds * rate_hz)
+        vals = []
+        dt = 1.0 / rate_hz
+        for _ in range(n):
+            raw = self._read_i16(self.GYRO_ZOUT_H) / self.scale
+            vals.append(raw)
+            time.sleep(dt)
+        self.bias_dps = float(np.mean(vals))
+
+
+class IMUThread(threading.Thread):
+    def __init__(self, ekf: EKF2D, stop_evt: threading.Event):
+        super().__init__(daemon=True)
+        self.ekf = ekf
+        self.stop_evt = stop_evt
+
+        self.imu = MPU6050(I2C_BUS, MPU6050_ADDR)
+        self._yaw_rate = 0.0
+        self._lock = threading.Lock()
+
+    def run(self):
+        print("[IMU] Calibrating gyro bias... keep robot still 2s.")
+        self.imu.calibrate_bias(2.0, 200.0)
+        print(f"[IMU] Bias gz = {self.imu.bias_dps:.5f} deg/s")
+
+        last = now_s()
+        while not self.stop_evt.is_set():
+            t = now_s()
+            dt = t - last
+            last = t
+
+            gz_dps = self.imu.read_gyro_z_dps()
+            yaw_rate = math.radians(gz_dps)
+
+            with self._lock:
+                self._yaw_rate = yaw_rate
+
+            # EKF predict using IMU yaw-rate
+            self.ekf.predict(dt, yaw_rate)
+
+            time.sleep(0.005)  # ~200 Hz
+
+    def get_yaw_rate(self) -> float:
+        with self._lock:
+            return float(self._yaw_rate)
+
+
+# =========================
+# LiDAR ICP odometry
+# =========================
+
+def scan_to_xy(scan) -> np.ndarray:
+    pts = []
+    k = 0
+    for (_q, ang_deg, dist_mm) in scan:
+        k += 1
+        if k % LIDAR_DOWNSAMPLE_STEP != 0:
+            continue
+        d = dist_mm / 1000.0
+        if d < LIDAR_MIN_RANGE_M or d > LIDAR_MAX_RANGE_M:
+            continue
+        a = math.radians(ang_deg)
+        pts.append((d * math.cos(a), d * math.sin(a)))
+        if len(pts) >= LIDAR_MAX_POINTS:
+            break
+    if len(pts) < 30:
+        return np.zeros((0, 2), dtype=float)
+    return np.array(pts, dtype=float)
+
+def nearest_neighbors(src: np.ndarray, dst: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+    diff = src[:, None, :] - dst[None, :, :]
+    d2 = np.sum(diff * diff, axis=2)
+    idx = np.argmin(d2, axis=1)
+    dist = np.sqrt(d2[np.arange(src.shape[0]), idx])
+    return idx, dist
+
+def best_fit_transform(A: np.ndarray, B: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+    cA = np.mean(A, axis=0)
+    cB = np.mean(B, axis=0)
+    AA = A - cA
+    BB = B - cB
+    H = AA.T @ BB
+    U, _, Vt = np.linalg.svd(H)
+    R = Vt.T @ U.T
+    if np.linalg.det(R) < 0:
+        Vt[1, :] *= -1
+        R = Vt.T @ U.T
+    t = cB - (R @ cA)
+    return R, t
+
+def icp_2d(source: np.ndarray, target: np.ndarray) -> Optional[Tuple[np.ndarray, np.ndarray]]:
+    if source.shape[0] < 30 or target.shape[0] < 30:
+        return None
+
+    src = source.copy()
+    R_total = np.eye(2, dtype=float)
+    t_total = np.zeros((2,), dtype=float)
+
+    prev_err = None
+    for _ in range(ICP_MAX_ITERS):
+        idx, dist = nearest_neighbors(src, target)
+        mask = dist < ICP_MAX_CORR_DIST
+        if np.count_nonzero(mask) < ICP_MIN_MATCHES:
+            return None
+
+        A = src[mask]
+        B = target[idx[mask]]
+
+        R, t = best_fit_transform(A, B)
+
+        # apply
+        src = (src @ R.T) + t
+
+        # compose
+        R_total = R @ R_total
+        t_total = (R @ t_total) + t
+
+        err = float(np.mean(dist[mask]))
+        if prev_err is not None and abs(prev_err - err) < ICP_CONVERGE_T:
+            break
+        prev_err = err
+
+    return R_total, t_total
+
+
+class LidarThread(threading.Thread):
+    """
+    Computes LiDAR odometry and updates EKF with:
+      z = [x, y, vx, vy, yaw]
+    """
+    def __init__(self, ekf: EKF2D, stop_evt: threading.Event):
+        super().__init__(daemon=True)
+        self.ekf = ekf
+        self.stop_evt = stop_evt
+
+        self.lidar = RPLidar(LIDAR_PORT, baudrate=LIDAR_BAUD)
+
+        self.prev_pts: Optional[np.ndarray] = None
+        self.prev_t: Optional[float] = None
+
+        # LiDAR world pose
+        self.xL = 0.0
+        self.yL = 0.0
+        self.yawL = 0.0
+
+    def run(self):
+        print("[LiDAR] Starting RPLidar...")
+        self.lidar.connect()
+        self.lidar.start_motor()
+
+        try:
+            for scan in self.lidar.iter_scans(max_buf_meas=1500):
+                if self.stop_evt.is_set():
+                    break
+
+                t = now_s()
+                pts = scan_to_xy(scan)
+                if pts.shape[0] < 60:
+                    continue
+
+                if self.prev_pts is None:
+                    self.prev_pts = pts
+                    self.prev_t = t
+                    continue
+
+                dt = (t - self.prev_t) if self.prev_t is not None else None
+                self.prev_t = t
+
+                result = icp_2d(self.prev_pts, pts)
+                self.prev_pts = pts
+
+                if result is None or dt is None or dt <= 1e-3:
+                    # ICP failed (no update this scan)
+                    continue
+
+                R, trans = result
+                dyaw_s = math.atan2(R[1, 0], R[0, 0])  # sensor-frame yaw delta
+                dx_s, dy_s = float(trans[0]), float(trans[1])
+
+                # convert delta translation to world using current yawL
+                d_world = rot2d(self.yawL) @ np.array([dx_s, dy_s], dtype=float)
+
+                # integrate world pose
+                self.xL += float(d_world[0])
+                self.yL += float(d_world[1])
+                self.yawL = wrap_pi(self.yawL + dyaw_s)
+
+                # velocities from LiDAR odom (world frame)
+                vxL = float(d_world[0] / dt)
+                vyL = float(d_world[1] / dt)
+
+                # measurement vector
+                z = np.array([self.xL, self.yL, vxL, vyL, self.yawL], dtype=float)
+
+                # EKF update
+                self.ekf.update_lidar(z)
+
+        finally:
+            print("[LiDAR] Stopping...")
+            try: self.lidar.stop()
+            except Exception: pass
+            try: self.lidar.stop_motor()
+            except Exception: pass
+            try: self.lidar.disconnect()
+            except Exception: pass
+
+
+# =========================
+# LOGGER
+# =========================
+
+class LoggerThread(threading.Thread):
+    def __init__(self, ekf: EKF2D, stop_evt: threading.Event):
+        super().__init__(daemon=True)
+        self.ekf = ekf
+        self.stop_evt = stop_evt
+        self.t0 = now_s()
+
+    def run(self):
+        period = 1.0 / float(PRINT_HZ)
+        with open(LOG_CSV_PATH, "w", newline="") as f:
+            w = csv.writer(f)
+            w.writerow(["time_s", "x_m", "y_m", "vx_mps", "vy_mps", "yaw_rad"])
+
+            while not self.stop_evt.is_set():
+                t = now_s() - self.t0
+                x, y, vx, vy, yaw = self.ekf.get_state()
+
+                w.writerow([f"{t:.3f}", f"{x:.4f}", f"{y:.4f}", f"{vx:.4f}", f"{vy:.4f}", f"{yaw:.5f}"])
+                f.flush()
+
+                print(f"t={t:7.2f}s | x={x:8.3f} y={y:8.3f} | vx={vx:7.3f} vy={vy:7.3f} | yaw={yaw:7.3f}")
+
+                time.sleep(period)
+
+
+# =========================
+# MAIN
+# =========================
+
+def main():
+    stop_evt = threading.Event()
+    ekf = EKF2D()
+
+    imu_thr = IMUThread(ekf, stop_evt)
+    lidar_thr = LidarThread(ekf, stop_evt)
+    log_thr = LoggerThread(ekf, stop_evt)
+
+    imu_thr.start()
+    lidar_thr.start()
+    log_thr.start()
+
+    print("\n[MAIN] Running fusion. Ctrl+C to stop.\n")
+    try:
+        while True:
+            time.sleep(0.5)
+    except KeyboardInterrupt:
+        pass
+    finally:
+        stop_evt.set()
+        time.sleep(0.5)
+        print(f"\n[MAIN] Saved log to: {LOG_CSV_PATH}\n")
+
+
+if __name__ == "__main__":
+    main()
