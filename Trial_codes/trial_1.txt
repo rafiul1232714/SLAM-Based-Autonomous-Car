@@ -1,1 +1,328 @@
+#!/usr/bin/env python3
+"""
+LiDAR + IMU fusion skeleton with "command vs position vs time" logging
+Outputs ONLY a CSV log (no graphs).
+
+Logs (per row):
+t_s, v_cmd_mps, w_cmd_rps, y_est_m, vx_est_mps, vy_est_mps, yaw_est_rad, y_lidar_m, yaw_lidar_rad
+
+⚠️ This is a complete runnable structure, but you MUST fill in:
+- read_imu()   -> get accel + gyro
+- read_lidar_pose() -> get (y, yaw) from ICP/SLAM/scan-matching or set to None if not available
+- motor_set_cmd(v_cmd, w_cmd) -> send commands to your motor driver
+"""
+
+import time
+import math
+import csv
+from pathlib import Path
+from dataclasses import dataclass
+from typing import Optional, Tuple
+
+import numpy as np
+
+
+# =========================
+# 1) CSV Logger
+# =========================
+class CmdStateLogger:
+    def __init__(self, csv_path: str):
+        self.path = Path(csv_path)
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+
+        self.t0 = time.perf_counter()
+        self.f = open(self.path, "w", newline="")
+        self.w = csv.writer(self.f)
+
+        self.w.writerow([
+            "t_s",
+            "v_cmd_mps",
+            "w_cmd_rps",
+            "y_est_m",
+            "vx_est_mps",
+            "vy_est_mps",
+            "yaw_est_rad",
+            "y_lidar_m",
+            "yaw_lidar_rad",
+        ])
+        self.f.flush()
+
+    def log(self,
+            v_cmd: float, w_cmd: float,
+            y_est: float, vx_est: float, vy_est: float, yaw_est: float,
+            y_lidar: float = float("nan"), yaw_lidar: float = float("nan")):
+        t = time.perf_counter() - self.t0
+        self.w.writerow([t, v_cmd, w_cmd, y_est, vx_est, vy_est, yaw_est, y_lidar, yaw_lidar])
+
+        # flush roughly once per second (safe + not too slow)
+        if int(t) != int(t - 0.02):
+            self.f.flush()
+
+    def close(self):
+        try:
+            self.f.flush()
+        finally:
+            self.f.close()
+
+
+# =========================
+# 2) Simple EKF for [y, vx, vy, yaw]
+#    - Predict from IMU (accel + gyro z)
+#    - Update from LiDAR pose (y, yaw) if available
+# =========================
+@dataclass
+class ImuSample:
+    ax_body: float   # m/s^2  (forward in robot frame)
+    ay_body: float   # m/s^2  (left in robot frame)
+    gz: float        # rad/s  (yaw rate)
+    dt: float        # seconds
+
+
+class EKF_Y_V_V_Yaw:
+    """
+    State: x = [y, vx, vy, yaw]^T
+      y   = position in world Y (m)   (you can treat it as "global y")
+      vx  = velocity in world X (m/s)
+      vy  = velocity in world Y (m/s)
+      yaw = heading (rad)
+
+    NOTE:
+    - This assumes the robot is mostly flat (roll/pitch small).
+    - Accel is rotated to world using yaw only.
+    - Gravity removal is assumed already handled OR roll/pitch approx 0.
+    """
+
+    def __init__(self):
+        self.x = np.zeros((4, 1), dtype=float)
+
+        # Covariance
+        self.P = np.eye(4) * 0.1
+
+        # Process noise (tune these!)
+        # Bigger values -> smoother but less trusting of IMU
+        self.q_yaw = 0.02         # rad^2 / s
+        self.q_v = 0.5            # (m/s^2)^2 scaled inside dt
+        self.q_y = 0.01           # m^2 / s
+
+        # Measurement noise for LiDAR pose update (tune these!)
+        self.r_y = 0.05           # m^2
+        self.r_yaw = 0.03         # rad^2
+
+    @staticmethod
+    def _wrap_pi(a: float) -> float:
+        return (a + math.pi) % (2 * math.pi) - math.pi
+
+    def predict(self, imu: ImuSample):
+        y, vx, vy, yaw = self.x.flatten()
+        dt = max(1e-4, imu.dt)
+
+        # Update yaw from gyro
+        yaw_pred = yaw + imu.gz * dt
+        yaw_pred = self._wrap_pi(yaw_pred)
+
+        # Rotate body accel to world using yaw (2D rotation)
+        cy = math.cos(yaw_pred)
+        sy = math.sin(yaw_pred)
+
+        ax_w = cy * imu.ax_body - sy * imu.ay_body
+        ay_w = sy * imu.ax_body + cy * imu.ay_body
+
+        # Update velocities (world frame)
+        vx_pred = vx + ax_w * dt
+        vy_pred = vy + ay_w * dt
+
+        # Update position y
+        y_pred = y + vy_pred * dt
+
+        self.x = np.array([[y_pred], [vx_pred], [vy_pred], [yaw_pred]], dtype=float)
+
+        # Jacobian F = d f / d x  (approx)
+        # y depends on vy; yaw affects rotation a bit but we keep it simple (stable + light)
+        F = np.array([
+            [1.0, 0.0, dt, 0.0],
+            [0.0, 1.0, 0.0, 0.0],
+            [0.0, 0.0, 1.0, 0.0],
+            [0.0, 0.0, 0.0, 1.0],
+        ], dtype=float)
+
+        # Process noise Q (scaled with dt)
+        Q = np.diag([
+            self.q_y * dt,
+            self.q_v * dt,
+            self.q_v * dt,
+            self.q_yaw * dt
+        ])
+
+        self.P = F @ self.P @ F.T + Q
+
+    def update_lidar_pose(self, y_meas: float, yaw_meas: float):
+        """
+        Measurement z = [y, yaw]^T
+        """
+        yaw_meas = self._wrap_pi(yaw_meas)
+
+        # z
+        z = np.array([[y_meas], [yaw_meas]], dtype=float)
+
+        # h(x) = [y, yaw]
+        y, vx, vy, yaw = self.x.flatten()
+        h = np.array([[y], [yaw]], dtype=float)
+
+        # Innovation with yaw wrap
+        innov = z - h
+        innov[1, 0] = self._wrap_pi(float(innov[1, 0]))
+
+        # H jacobian
+        H = np.array([
+            [1.0, 0.0, 0.0, 0.0],   # y
+            [0.0, 0.0, 0.0, 1.0],   # yaw
+        ], dtype=float)
+
+        R = np.diag([self.r_y, self.r_yaw])
+
+        S = H @ self.P @ H.T + R
+        K = self.P @ H.T @ np.linalg.inv(S)
+
+        self.x = self.x + K @ innov
+        self.x[3, 0] = self._wrap_pi(float(self.x[3, 0]))
+
+        I = np.eye(4)
+        self.P = (I - K @ H) @ self.P
+
+
+# =========================
+# 3) Hardware hooks you must fill
+# =========================
+def read_imu() -> Tuple[float, float, float]:
+    """
+    Return (ax_body, ay_body, gz) in SI units:
+      ax_body: m/s^2 (forward)
+      ay_body: m/s^2 (left)
+      gz:      rad/s (yaw rate)
+
+    ---- IMPLEMENT THIS using your GY-87:
+    - MPU6050 accel + gyro
+    - convert to m/s^2 and rad/s
+    - apply calibration/offsets
+    """
+    # PLACEHOLDER: robot standing still
+    ax_body = 0.0
+    ay_body = 0.0
+    gz = 0.0
+    return ax_body, ay_body, gz
+
+
+def read_lidar_pose() -> Optional[Tuple[float, float]]:
+    """
+    Return (y_lidar, yaw_lidar) if a new LiDAR-based pose is available,
+    otherwise return None.
+
+    ---- IMPLEMENT THIS:
+    - If you run ICP/scan-matching and compute pose, return it here.
+    - If you only have incremental delta, accumulate it outside and return pose.
+    """
+    return None
+
+
+def motor_set_cmd(v_cmd_mps: float, w_cmd_rps: float) -> None:
+    """
+    Send motor commands.
+    v_cmd_mps: linear velocity command (m/s)
+    w_cmd_rps: angular velocity command (rad/s)
+
+    ---- IMPLEMENT THIS:
+    - Convert (v, w) to left/right wheel speeds
+    - Convert to PWM / GPIO for L298N
+    """
+    # PLACEHOLDER: do nothing
+    pass
+
+
+# =========================
+# 4) Example command generator (replace with your A->B controller)
+# =========================
+def example_command(t_s: float) -> Tuple[float, float]:
+    """
+    Simple demo command:
+    - 0..2s: stop
+    - 2..6s: go straight v=0.25
+    - 6..8s: turn in place w=0.6
+    - >8s: stop
+    """
+    if t_s < 2.0:
+        return 0.0, 0.0
+    if t_s < 6.0:
+        return 0.25, 0.0
+    if t_s < 8.0:
+        return 0.0, 0.6
+    return 0.0, 0.0
+
+
+# =========================
+# 5) Main loop
+# =========================
+def main():
+    loop_hz = 50.0
+    dt_target = 1.0 / loop_hz
+
+    ekf = EKF_Y_V_V_Yaw()
+    logger = CmdStateLogger("logs/cmd_vs_state.csv")
+
+    t0 = time.perf_counter()
+    t_prev = t0
+
+    try:
+        while True:
+            now = time.perf_counter()
+            dt = now - t_prev
+            t_prev = now
+            t_s = now - t0
+
+            # 1) COMMAND (replace this with your controller output)
+            v_cmd, w_cmd = example_command(t_s)
+
+            # 2) SEND COMMAND to motors
+            motor_set_cmd(v_cmd, w_cmd)
+
+            # 3) READ IMU
+            ax_body, ay_body, gz = read_imu()
+            imu = ImuSample(ax_body=ax_body, ay_body=ay_body, gz=gz, dt=dt)
+
+            # 4) EKF PREDICT
+            ekf.predict(imu)
+
+            # 5) LIDAR UPDATE (if available)
+            lidar_pose = read_lidar_pose()
+            if lidar_pose is not None:
+                y_lidar, yaw_lidar = lidar_pose
+                ekf.update_lidar_pose(y_lidar, yaw_lidar)
+            else:
+                y_lidar, yaw_lidar = float("nan"), float("nan")
+
+            # 6) LOG EVERYTHING (this is what your professor wants)
+            y_est = float(ekf.x[0, 0])
+            vx_est = float(ekf.x[1, 0])
+            vy_est = float(ekf.x[2, 0])
+            yaw_est = float(ekf.x[3, 0])
+
+            logger.log(
+                v_cmd=v_cmd, w_cmd=w_cmd,
+                y_est=y_est, vx_est=vx_est, vy_est=vy_est, yaw_est=yaw_est,
+                y_lidar=y_lidar, yaw_lidar=yaw_lidar
+            )
+
+            # 7) loop timing
+            sleep_t = dt_target - (time.perf_counter() - now)
+            if sleep_t > 0:
+                time.sleep(sleep_t)
+
+    except KeyboardInterrupt:
+        pass
+    finally:
+        logger.close()
+        motor_set_cmd(0.0, 0.0)
+
+
+if __name__ == "__main__":
+    main()
 
