@@ -1,0 +1,402 @@
+"""
+EKF Navigation System - GY-87 IMU + LiDAR on Raspberry Pi
+=========================================================
+Wiring (GY-87):
+  VCC -> Pin 1 (3.3V)
+  GND -> Pin 6
+  SDA -> Pin 3 (GPIO2)
+  SCL -> Pin 5 (GPIO3)
+
+State vector: [x, y, vx, vy, yaw]
+Install: pip3 install smbus2 numpy RPi.GPIO
+"""
+
+import numpy as np
+import smbus2
+import time
+import math
+import logging
+from collections import deque
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s"
+)
+log = logging.getLogger("EKF_NAV")
+
+# ─────────────────────────────────────────────
+# GY-87 I2C Addresses
+# ─────────────────────────────────────────────
+MPU6050_ADDR  = 0x68   # Accel + Gyro
+HMC5883L_ADDR = 0x1E   # Magnetometer (accessed via MPU bypass)
+BMP180_ADDR   = 0x77   # Barometer
+
+# MPU6050 Registers
+PWR_MGMT_1    = 0x6B
+ACCEL_XOUT_H  = 0x3B
+GYRO_XOUT_H   = 0x43
+ACCEL_CONFIG  = 0x1C
+GYRO_CONFIG   = 0x1B
+INT_PIN_CFG   = 0x37   # bypass enable for magnetometer
+
+# HMC5883L Registers
+HMC_CONFIG_A  = 0x00
+HMC_CONFIG_B  = 0x01
+HMC_MODE      = 0x02
+HMC_DATA_X_H  = 0x03
+
+# ─────────────────────────────────────────────
+# Sensor Driver
+# ─────────────────────────────────────────────
+class GY87:
+    def __init__(self, bus_num=1):
+        self.bus = smbus2.SMBus(bus_num)
+        self._init_mpu6050()
+        self._init_hmc5883l()
+        self.gyro_bias = np.zeros(3)
+        self.accel_bias = np.zeros(3)
+        self.calibrate(samples=200)
+
+    def _init_mpu6050(self):
+        # Wake up MPU6050
+        self.bus.write_byte_data(MPU6050_ADDR, PWR_MGMT_1, 0x00)
+        time.sleep(0.1)
+        # ±2g accelerometer, ±250°/s gyro
+        self.bus.write_byte_data(MPU6050_ADDR, ACCEL_CONFIG, 0x00)
+        self.bus.write_byte_data(MPU6050_ADDR, GYRO_CONFIG, 0x00)
+        # Enable I2C bypass so we can talk to HMC5883L directly
+        self.bus.write_byte_data(MPU6050_ADDR, INT_PIN_CFG, 0x02)
+        time.sleep(0.05)
+
+    def _init_hmc5883l(self):
+        try:
+            # 8-sample avg, 15Hz, normal measurement
+            self.bus.write_byte_data(HMC5883L_ADDR, HMC_CONFIG_A, 0x70)
+            self.bus.write_byte_data(HMC5883L_ADDR, HMC_CONFIG_B, 0x20)
+            self.bus.write_byte_data(HMC5883L_ADDR, HMC_MODE,     0x00)
+            self.mag_available = True
+        except Exception as e:
+            log.warning(f"HMC5883L not found: {e}")
+            self.mag_available = False
+
+    def _read_word(self, addr, reg):
+        high = self.bus.read_byte_data(addr, reg)
+        low  = self.bus.read_byte_data(addr, reg + 1)
+        val  = (high << 8) | low
+        return val - 65536 if val > 32767 else val
+
+    def read_accel(self):
+        """Returns acceleration in m/s² (x, y, z)"""
+        ax = self._read_word(MPU6050_ADDR, ACCEL_XOUT_H)
+        ay = self._read_word(MPU6050_ADDR, ACCEL_XOUT_H + 2)
+        az = self._read_word(MPU6050_ADDR, ACCEL_XOUT_H + 4)
+        scale = 16384.0  # ±2g → LSB/g
+        g = 9.80665
+        return np.array([ax, ay, az]) / scale * g
+
+    def read_gyro(self):
+        """Returns angular velocity in rad/s (x, y, z)"""
+        gx = self._read_word(MPU6050_ADDR, GYRO_XOUT_H)
+        gy = self._read_word(MPU6050_ADDR, GYRO_XOUT_H + 2)
+        gz = self._read_word(MPU6050_ADDR, GYRO_XOUT_H + 4)
+        scale = 131.0   # ±250°/s
+        return np.array([gx, gy, gz]) / scale * (math.pi / 180.0)
+
+    def read_mag(self):
+        """Returns magnetometer raw data for heading"""
+        if not self.mag_available:
+            return None
+        try:
+            mx = self._read_word(HMC5883L_ADDR, HMC_DATA_X_H)
+            mz = self._read_word(HMC5883L_ADDR, HMC_DATA_X_H + 2)
+            my = self._read_word(HMC5883L_ADDR, HMC_DATA_X_H + 4)
+            return np.array([mx, my, mz])
+        except:
+            return None
+
+    def calibrate(self, samples=200):
+        log.info("Calibrating IMU... keep sensor still")
+        gyro_sum  = np.zeros(3)
+        accel_sum = np.zeros(3)
+        for _ in range(samples):
+            gyro_sum  += self.read_gyro()
+            accel_sum += self.read_accel()
+            time.sleep(0.01)
+        self.gyro_bias  = gyro_sum / samples
+        # Remove gravity from Z
+        raw_accel_bias  = accel_sum / samples
+        self.accel_bias = raw_accel_bias.copy()
+        self.accel_bias[2] -= 9.80665
+        log.info(f"Gyro bias:  {self.gyro_bias}")
+        log.info(f"Accel bias: {self.accel_bias}")
+
+    def get_imu(self):
+        """Returns calibrated accel (m/s²) and gyro (rad/s)"""
+        accel = self.read_accel() - self.accel_bias
+        gyro  = self.read_gyro()  - self.gyro_bias
+        return accel, gyro
+
+    def get_heading(self):
+        """Returns magnetic heading in radians"""
+        mag = self.read_mag()
+        if mag is None:
+            return None
+        heading = math.atan2(mag[1], mag[0])
+        return heading
+
+
+# ─────────────────────────────────────────────
+# LiDAR Interface (stub — replace with your model)
+# ─────────────────────────────────────────────
+class LiDAR:
+    """
+    Replace this class body with your LiDAR SDK.
+    Common models: RPLiDAR (rplidar library), YDLIDAR, TFmini (serial).
+    
+    Expected output: (x_meas, y_meas) absolute position in meters
+    or None if no fix.
+    """
+    def __init__(self):
+        # Example: from rplidar import RPLidar
+        # self.lidar = RPLidar('/dev/ttyUSB0')
+        log.info("LiDAR: using stub — replace with real driver")
+        self._sim_pos = np.array([0.0, 0.0])
+
+    def get_position(self):
+        """
+        Returns (x, y) in meters or None.
+        For SLAM-based LiDAR: return estimated position.
+        For range-only: compute from scan + known landmarks.
+        """
+        # ── STUB: replace with real read ──────────────────
+        # Simulates slight noise on a stationary target
+        noise = np.random.normal(0, 0.05, 2)
+        return self._sim_pos + noise
+        # ─────────────────────────────────────────────────
+
+    def close(self):
+        pass
+
+
+# ─────────────────────────────────────────────
+# Extended Kalman Filter
+# ─────────────────────────────────────────────
+class EKF:
+    """
+    State:  X = [x, y, vx, vy, yaw]   (5×1)
+    
+    Process model (IMU-driven):
+      x   += vx*dt + 0.5*ax_w*dt²
+      y   += vy*dt + 0.5*ay_w*dt²
+      vx  += ax_w * dt
+      vy  += ay_w * dt
+      yaw += gyro_z * dt
+
+    Measurement model (LiDAR):
+      z = [x, y]   (direct position observation)
+    """
+    def __init__(self):
+        # State vector [x, y, vx, vy, yaw]
+        self.X = np.zeros(5)
+
+        # State covariance
+        self.P = np.diag([1.0, 1.0, 0.5, 0.5, 0.1])
+
+        # Process noise covariance Q
+        self.Q = np.diag([
+            0.01,   # x
+            0.01,   # y
+            0.10,   # vx
+            0.10,   # vy
+            0.005   # yaw
+        ])
+
+        # Measurement noise covariance R (LiDAR x, y)
+        self.R_lidar = np.diag([0.05, 0.05])  # 5cm std dev
+
+        # Measurement noise R for magnetometer yaw
+        self.R_mag = np.array([[0.05]])
+
+        # Observation matrix H for LiDAR [x, y]
+        self.H_lidar = np.array([
+            [1, 0, 0, 0, 0],
+            [0, 1, 0, 0, 0]
+        ])
+
+        # Observation matrix H for magnetometer [yaw]
+        self.H_mag = np.array([[0, 0, 0, 0, 1]])
+
+    def predict(self, accel, gyro_z, dt):
+        """
+        EKF Predict step using IMU measurements.
+        accel: [ax, ay] in body frame (m/s²)
+        gyro_z: yaw rate (rad/s)
+        dt: time step (s)
+        """
+        x, y, vx, vy, yaw = self.X
+
+        # Rotate body-frame accel to world frame
+        cos_y = math.cos(yaw)
+        sin_y = math.sin(yaw)
+        ax_w = cos_y * accel[0] - sin_y * accel[1]
+        ay_w = sin_y * accel[0] + cos_y * accel[1]
+
+        # State prediction
+        x_new   = x   + vx * dt + 0.5 * ax_w * dt**2
+        y_new   = y   + vy * dt + 0.5 * ay_w * dt**2
+        vx_new  = vx  + ax_w * dt
+        vy_new  = vy  + ay_w * dt
+        yaw_new = yaw + gyro_z * dt
+
+        # Normalize yaw to [-π, π]
+        yaw_new = math.atan2(math.sin(yaw_new), math.cos(yaw_new))
+
+        self.X = np.array([x_new, y_new, vx_new, vy_new, yaw_new])
+
+        # Jacobian of process model F (5×5)
+        # Partial derivatives of [ax_w, ay_w] w.r.t. yaw
+        dax_dyaw = -sin_y * accel[0] - cos_y * accel[1]
+        day_dyaw =  cos_y * accel[0] - sin_y * accel[1]
+
+        F = np.eye(5)
+        F[0, 2] = dt
+        F[1, 3] = dt
+        F[0, 4] = 0.5 * dax_dyaw * dt**2
+        F[1, 4] = 0.5 * day_dyaw * dt**2
+        F[2, 4] = dax_dyaw * dt
+        F[3, 4] = day_dyaw * dt
+
+        # Covariance prediction
+        self.P = F @ self.P @ F.T + self.Q
+
+    def update_lidar(self, z_lidar):
+        """
+        EKF Update step with LiDAR position measurement [x, y].
+        """
+        z = np.array(z_lidar[:2])
+        H = self.H_lidar
+        y_res = z - H @ self.X                  # innovation
+        S = H @ self.P @ H.T + self.R_lidar     # innovation cov
+        K = self.P @ H.T @ np.linalg.inv(S)     # Kalman gain
+        self.X = self.X + K @ y_res
+        self.X[4] = math.atan2(math.sin(self.X[4]), math.cos(self.X[4]))
+        I_KH = np.eye(5) - K @ H
+        self.P = I_KH @ self.P @ I_KH.T + K @ self.R_lidar @ K.T  # Joseph form
+
+    def update_mag(self, heading):
+        """
+        EKF Update step with magnetometer heading (rad).
+        """
+        if heading is None:
+            return
+        H = self.H_mag
+        yaw_pred = self.X[4]
+        # Normalize innovation angle
+        y_res = np.array([math.atan2(math.sin(heading - yaw_pred),
+                                     math.cos(heading - yaw_pred))])
+        S = H @ self.P @ H.T + self.R_mag
+        K = self.P @ H.T @ np.linalg.inv(S)
+        self.X = self.X + K @ y_res
+        self.X[4] = math.atan2(math.sin(self.X[4]), math.cos(self.X[4]))
+        self.P = (np.eye(5) - K @ H) @ self.P
+
+    @property
+    def state(self):
+        return {
+            "x":   self.X[0],
+            "y":   self.X[1],
+            "vx":  self.X[2],
+            "vy":  self.X[3],
+            "yaw": math.degrees(self.X[4]),
+            "speed": math.hypot(self.X[2], self.X[3])
+        }
+
+
+# ─────────────────────────────────────────────
+# Logger / CSV writer
+# ─────────────────────────────────────────────
+class NavLogger:
+    def __init__(self, path="nav_log.csv"):
+        self.path = path
+        with open(path, "w") as f:
+            f.write("timestamp,x,y,vx,vy,yaw_deg,speed\n")
+
+    def log(self, t, state):
+        with open(self.path, "a") as f:
+            f.write(f"{t:.4f},{state['x']:.4f},{state['y']:.4f},"
+                    f"{state['vx']:.4f},{state['vy']:.4f},"
+                    f"{state['yaw']:.2f},{state['speed']:.4f}\n")
+
+
+# ─────────────────────────────────────────────
+# Main Navigation Loop
+# ─────────────────────────────────────────────
+def main():
+    log.info("Initializing GY-87...")
+    imu    = GY87(bus_num=1)
+    lidar  = LiDAR()
+    ekf    = EKF()
+    logger = NavLogger("nav_log.csv")
+
+    LIDAR_UPDATE_HZ = 10   # LiDAR update rate
+    IMU_HZ          = 100  # IMU prediction rate
+    dt_imu          = 1.0 / IMU_HZ
+    lidar_counter   = 0
+    lidar_interval  = IMU_HZ // LIDAR_UPDATE_HZ  # every N IMU steps
+
+    log.info("Navigation loop started. Ctrl+C to stop.")
+    t_start = time.time()
+    t_prev  = t_start
+
+    try:
+        while True:
+            t_now = time.time()
+            dt    = t_now - t_prev
+            t_prev = t_now
+
+            # ── IMU Read ──────────────────────────────
+            accel, gyro = imu.get_imu()
+
+            # ── EKF Predict ───────────────────────────
+            ekf.predict(accel[:2], gyro[2], dt)
+
+            # ── Magnetometer Update (every step) ──────
+            heading = imu.get_heading()
+            ekf.update_mag(heading)
+
+            # ── LiDAR Update (at lower rate) ──────────
+            lidar_counter += 1
+            if lidar_counter >= lidar_interval:
+                lidar_counter = 0
+                pos = lidar.get_position()
+                if pos is not None:
+                    ekf.update_lidar(pos)
+
+            # ── Output ────────────────────────────────
+            elapsed = t_now - t_start
+            state   = ekf.state
+            logger.log(elapsed, state)
+
+            log.info(
+                f"t={elapsed:7.2f}s | "
+                f"x={state['x']:7.3f}m  y={state['y']:7.3f}m | "
+                f"vx={state['vx']:6.3f}  vy={state['vy']:6.3f} m/s | "
+                f"yaw={state['yaw']:7.2f}° | "
+                f"spd={state['speed']:.3f} m/s"
+            )
+
+            # ── Sleep to maintain IMU rate ─────────────
+            elapsed_step = time.time() - t_now
+            sleep_time   = dt_imu - elapsed_step
+            if sleep_time > 0:
+                time.sleep(sleep_time)
+
+    except KeyboardInterrupt:
+        log.info("Stopped by user.")
+    finally:
+        lidar.close()
+        log.info("Nav log saved to nav_log.csv")
+
+
+if __name__ == "__main__":
+    main()
