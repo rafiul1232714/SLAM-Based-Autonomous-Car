@@ -1,0 +1,687 @@
+"""
+Phase 2 Controlled Motion Test — EKF Navigation System
+=======================================================
+Motor Controller: L298N (or compatible)
+  IN1 → Pin 11  (GPIO 17)   Motor A direction
+  IN2 → Pin 13  (GPIO 27)   Motor A direction
+  IN3 → Pin 15  (GPIO 22)   Motor B direction
+  IN4 → Pin 16  (GPIO 23)   Motor B direction
+  ENA → Pin 12  (GPIO 18)   Motor A PWM speed
+  ENB → Pin 35  (GPIO 19)   Motor B PWM speed
+
+Coordinate frame:
+  +X = forward   (car drives forward  → x increases, vx positive)
+  -X = reverse   (car drives backward → x decreases, vx negative)
+  +Y = left
+  -Y = right
+
+Tests run automatically in sequence:
+  T1 — Forward  1m then stop   → x should reach ~1.0m
+  T2 — Reverse back to origin  → x should return to ~0.0m
+  T3 — 90° left turn           → yaw should change by ~+90°
+  T4 — 90° right turn          → yaw should return to original
+
+Run: python3 phase2_motion_test.py
+Install: pip3 install smbus2 numpy RPi.GPIO
+"""
+
+import numpy as np
+import smbus2
+import time
+import math
+import logging
+from collections import deque
+
+try:
+    import RPi.GPIO as GPIO
+    GPIO_AVAILABLE = True
+except ImportError:
+    GPIO_AVAILABLE = False
+    print("WARNING: RPi.GPIO not found — motor will not move (sensor-only mode)")
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
+log = logging.getLogger("PHASE2")
+
+# ─────────────────────────────────────────────
+# Motor Controller Pin Map (BOARD numbering)
+# ─────────────────────────────────────────────
+PIN_IN1 = 11    # Motor A direction 1
+PIN_IN2 = 13    # Motor A direction 2
+PIN_IN3 = 15    # Motor B direction 1
+PIN_IN4 = 16    # Motor B direction 2
+PIN_ENA = 12    # Motor A PWM enable
+PIN_ENB = 35    # Motor B PWM enable
+
+# Slow speed so you can read values comfortably (30% duty cycle)
+# Increase if motors don't move, decrease if too fast to observe
+DRIVE_SPEED  = 30   # % PWM duty — forward / reverse
+TURN_SPEED   = 25   # % PWM duty — turning (slightly slower for cleaner yaw)
+
+# ─────────────────────────────────────────────
+# I2C Addresses & Registers
+# ─────────────────────────────────────────────
+MPU6050_ADDR  = 0x68
+HMC5883L_ADDR = 0x1E
+PWR_MGMT_1    = 0x6B
+ACCEL_XOUT_H  = 0x3B
+GYRO_XOUT_H   = 0x43
+ACCEL_CONFIG  = 0x1C
+GYRO_CONFIG   = 0x1B
+INT_PIN_CFG   = 0x37
+HMC_CONFIG_A  = 0x00
+HMC_CONFIG_B  = 0x01
+HMC_MODE      = 0x02
+HMC_DATA_X_H  = 0x03
+
+
+# ─────────────────────────────────────────────
+# Motor Controller
+# ─────────────────────────────────────────────
+class MotorController:
+    def __init__(self):
+        if not GPIO_AVAILABLE:
+            log.warning("GPIO unavailable — running in sensor-only mode")
+            self._pwm_a = None
+            self._pwm_b = None
+            return
+
+        GPIO.setmode(GPIO.BOARD)
+        GPIO.setwarnings(False)
+        for pin in [PIN_IN1, PIN_IN2, PIN_IN3, PIN_IN4, PIN_ENA, PIN_ENB]:
+            GPIO.setup(pin, GPIO.OUT)
+            GPIO.output(pin, GPIO.LOW)
+
+        self._pwm_a = GPIO.PWM(PIN_ENA, 1000)   # 1kHz PWM
+        self._pwm_b = GPIO.PWM(PIN_ENB, 1000)
+        self._pwm_a.start(0)
+        self._pwm_b.start(0)
+        log.info("Motor controller ready.")
+
+    def _set_dir(self, in1, in2, in3, in4):
+        if not GPIO_AVAILABLE: return
+        GPIO.output(PIN_IN1, in1)
+        GPIO.output(PIN_IN2, in2)
+        GPIO.output(PIN_IN3, in3)
+        GPIO.output(PIN_IN4, in4)
+
+    def _set_speed(self, speed_a, speed_b):
+        if not GPIO_AVAILABLE: return
+        self._pwm_a.ChangeDutyCycle(speed_a)
+        self._pwm_b.ChangeDutyCycle(speed_b)
+
+    def forward(self, speed=DRIVE_SPEED):
+        """Both motors forward → car moves forward → x increases"""
+        self._set_dir(GPIO.HIGH, GPIO.LOW, GPIO.HIGH, GPIO.LOW)
+        self._set_speed(speed, speed)
+
+    def reverse(self, speed=DRIVE_SPEED):
+        """Both motors reverse → car moves backward → x decreases"""
+        self._set_dir(GPIO.LOW, GPIO.HIGH, GPIO.LOW, GPIO.HIGH)
+        self._set_speed(speed, speed)
+
+    def turn_left(self, speed=TURN_SPEED):
+        """Motor A reverse, Motor B forward → car turns left → yaw increases"""
+        self._set_dir(GPIO.LOW, GPIO.HIGH, GPIO.HIGH, GPIO.LOW)
+        self._set_speed(speed, speed)
+
+    def turn_right(self, speed=TURN_SPEED):
+        """Motor A forward, Motor B reverse → car turns right → yaw decreases"""
+        self._set_dir(GPIO.HIGH, GPIO.LOW, GPIO.LOW, GPIO.HIGH)
+        self._set_speed(speed, speed)
+
+    def stop(self):
+        self._set_speed(0, 0)
+        self._set_dir(GPIO.LOW, GPIO.LOW, GPIO.LOW, GPIO.LOW)
+
+    def cleanup(self):
+        self.stop()
+        if GPIO_AVAILABLE:
+            if self._pwm_a: self._pwm_a.stop()
+            if self._pwm_b: self._pwm_b.stop()
+            GPIO.cleanup()
+
+
+# ─────────────────────────────────────────────
+# GY-87 IMU Driver
+# ─────────────────────────────────────────────
+class GY87:
+    def __init__(self, bus_num=1):
+        self.bus = smbus2.SMBus(bus_num)
+        self._init_mpu6050()
+        self._init_hmc5883l()
+        self.gyro_bias  = np.zeros(3)
+        self.accel_bias = np.zeros(3)
+        self.roll  = 0.0
+        self.pitch = 0.0
+        self.COMP_ALPHA      = 0.98
+        self.IGNORE_ROLL_PITCH = True
+        self.MAG_LPF         = 0.03
+        self.mag_filtered    = None
+        self.calibrate(samples=500)
+
+    def _init_mpu6050(self):
+        self.bus.write_byte_data(MPU6050_ADDR, PWR_MGMT_1,   0x00)
+        time.sleep(0.1)
+        self.bus.write_byte_data(MPU6050_ADDR, ACCEL_CONFIG, 0x00)
+        self.bus.write_byte_data(MPU6050_ADDR, GYRO_CONFIG,  0x00)
+        self.bus.write_byte_data(MPU6050_ADDR, INT_PIN_CFG,  0x02)
+        time.sleep(0.05)
+
+    def _init_hmc5883l(self):
+        try:
+            self.bus.write_byte_data(HMC5883L_ADDR, HMC_CONFIG_A, 0x70)
+            self.bus.write_byte_data(HMC5883L_ADDR, HMC_CONFIG_B, 0x20)
+            self.bus.write_byte_data(HMC5883L_ADDR, HMC_MODE,     0x00)
+            self.mag_available = True
+            log.info("HMC5883L found.")
+        except Exception as e:
+            log.warning(f"HMC5883L not found: {e}")
+            self.mag_available = False
+
+    def _read_word(self, addr, reg):
+        high = self.bus.read_byte_data(addr, reg)
+        low  = self.bus.read_byte_data(addr, reg + 1)
+        val  = (high << 8) | low
+        return val - 65536 if val > 32767 else val
+
+    def read_accel_raw(self):
+        ax = self._read_word(MPU6050_ADDR, ACCEL_XOUT_H)
+        ay = self._read_word(MPU6050_ADDR, ACCEL_XOUT_H + 2)
+        az = self._read_word(MPU6050_ADDR, ACCEL_XOUT_H + 4)
+        return np.array([ax, ay, az]) / 16384.0 * 9.80665
+
+    def read_gyro_raw(self):
+        gx = self._read_word(MPU6050_ADDR, GYRO_XOUT_H)
+        gy = self._read_word(MPU6050_ADDR, GYRO_XOUT_H + 2)
+        gz = self._read_word(MPU6050_ADDR, GYRO_XOUT_H + 4)
+        return np.array([gx, gy, gz]) / 131.0 * (math.pi / 180.0)
+
+    def read_mag_raw(self):
+        if not self.mag_available: return None
+        try:
+            mx = self._read_word(HMC5883L_ADDR, HMC_DATA_X_H)
+            mz = self._read_word(HMC5883L_ADDR, HMC_DATA_X_H + 2)
+            my = self._read_word(HMC5883L_ADDR, HMC_DATA_X_H + 4)
+            return np.array([float(mx), float(my), float(mz)])
+        except:
+            return None
+
+    def calibrate(self, samples=500):
+        log.info(f"Calibrating ({samples} samples) — keep STILL...")
+        g_sum = np.zeros(3)
+        a_sum = np.zeros(3)
+        for i in range(samples):
+            g_sum += self.read_gyro_raw()
+            a_sum += self.read_accel_raw()
+            time.sleep(0.005)
+            if i % 100 == 0:
+                log.info(f"  {i}/{samples}...")
+        self.gyro_bias      = g_sum / samples
+        self.accel_bias     = a_sum / samples
+        self.accel_bias[2] -= 9.80665
+        log.info(f"Gyro bias  (rad/s): {np.round(self.gyro_bias, 5)}")
+        log.info(f"Accel bias (m/s²):  {np.round(self.accel_bias, 5)}")
+
+    def update_bias_adaptive(self, accel, gyro, alpha=0.005):
+        self.gyro_bias[0] += alpha * gyro[0]
+        self.gyro_bias[1] += alpha * gyro[1]
+        self.gyro_bias[2] += alpha * 3.0 * gyro[2]
+        self.accel_bias[0] += alpha * accel[0]
+        self.accel_bias[1] += alpha * accel[1]
+
+    def update_tilt(self, accel_cal, gyro, dt):
+        norm = np.linalg.norm(accel_cal)
+        if norm < 1.0: return
+        ax, ay, az = accel_cal / norm
+        roll_accel  =  math.atan2(ay, az)
+        pitch_accel = -math.asin(max(-1.0, min(1.0, ax)))
+        self.roll  = self.COMP_ALPHA * (self.roll  + gyro[0] * dt) \
+                     + (1 - self.COMP_ALPHA) * roll_accel
+        self.pitch = self.COMP_ALPHA * (self.pitch + gyro[1] * dt) \
+                     + (1 - self.COMP_ALPHA) * pitch_accel
+
+    def remove_gravity(self, accel_cal):
+        if self.IGNORE_ROLL_PITCH:
+            return np.array([accel_cal[0], accel_cal[1], 0.0])
+        cr, sr = math.cos(self.roll),  math.sin(self.roll)
+        cp, sp = math.cos(self.pitch), math.sin(self.pitch)
+        grav = np.array([sp * 9.80665, -sr * cp * 9.80665, -cr * cp * 9.80665])
+        return accel_cal - grav
+
+    def get_heading(self):
+        mag = self.read_mag_raw()
+        if mag is None: return None
+        cr, sr = math.cos(self.roll),  math.sin(self.roll)
+        cp, sp = math.cos(self.pitch), math.sin(self.pitch)
+        mx =  mag[0] * cp + mag[2] * sp
+        my =  mag[0] * sr * sp + mag[1] * cr - mag[2] * sr * cp
+        heading_raw = math.atan2(my, mx)
+        if self.mag_filtered is None:
+            self.mag_filtered = heading_raw
+            return heading_raw
+        diff = math.atan2(math.sin(heading_raw - self.mag_filtered),
+                          math.cos(heading_raw - self.mag_filtered))
+        self.mag_filtered = math.atan2(
+            math.sin(self.mag_filtered + self.MAG_LPF * diff),
+            math.cos(self.mag_filtered + self.MAG_LPF * diff)
+        )
+        return self.mag_filtered
+
+
+# ─────────────────────────────────────────────
+# EKF
+# ─────────────────────────────────────────────
+class EKF:
+    def __init__(self):
+        self.X = np.zeros(5)   # [x, y, vx, vy, yaw]
+        self.P = np.diag([1.0, 1.0, 0.5, 0.5, 0.1])
+        self.Q_moving = np.diag([0.01, 0.01, 0.10, 0.10, 0.001])
+        self.Q_static = np.diag([0.001, 0.001, 0.001, 0.001, 0.0001])
+        self.Q = self.Q_moving.copy()
+        self.R_lidar      = np.diag([0.04, 0.04])
+        self.R_mag_moving = np.array([[0.20]])
+        self.R_mag_static = np.array([[0.02]])
+        self.R_mag        = self.R_mag_moving.copy()
+        self.R_zupt       = np.diag([0.001, 0.001])
+
+    def predict(self, accel, gyro_z, dt):
+        x, y, vx, vy, yaw = self.X
+        cos_y = math.cos(yaw); sin_y = math.sin(yaw)
+        ax_w  = cos_y * accel[0] - sin_y * accel[1]
+        ay_w  = sin_y * accel[0] + cos_y * accel[1]
+        self.X[0] = x  + vx * dt + 0.5 * ax_w * dt**2
+        self.X[1] = y  + vy * dt + 0.5 * ay_w * dt**2
+        self.X[2] = vx + ax_w * dt
+        self.X[3] = vy + ay_w * dt
+        self.X[4] = math.atan2(math.sin(yaw + gyro_z * dt),
+                               math.cos(yaw + gyro_z * dt))
+        dax_dyaw = -sin_y * accel[0] - cos_y * accel[1]
+        day_dyaw =  cos_y * accel[0] - sin_y * accel[1]
+        F = np.eye(5)
+        F[0,2]=dt; F[1,3]=dt
+        F[0,4]=0.5*dax_dyaw*dt**2; F[1,4]=0.5*day_dyaw*dt**2
+        F[2,4]=dax_dyaw*dt;        F[3,4]=day_dyaw*dt
+        self.P = F @ self.P @ F.T + self.Q
+
+    def update_mag(self, heading):
+        if heading is None: return
+        H     = np.array([[0,0,0,0,1]])
+        y_res = np.array([math.atan2(math.sin(heading - self.X[4]),
+                                     math.cos(heading - self.X[4]))])
+        S = H @ self.P @ H.T + self.R_mag
+        K = self.P @ H.T @ np.linalg.inv(S)
+        self.X += (K @ y_res).flatten()
+        self.X[4] = math.atan2(math.sin(self.X[4]), math.cos(self.X[4]))
+        self.P = (np.eye(5) - K @ H) @ self.P
+
+    def update_zupt(self):
+        H = np.array([[0,0,1,0,0],[0,0,0,1,0]])
+        self._apply_update(H, np.zeros(2), self.R_zupt)
+
+    def update_yaw_rate_zupt(self):
+        H = np.array([[0,0,0,0,1]])
+        R = np.array([[0.005]])
+        S = H @ self.P @ H.T + R
+        K = self.P @ H.T @ np.linalg.inv(S)
+        if self.P[4,4] > 0.001:
+            self.X += (K @ np.array([0.0])).flatten()
+            self.X[4] = math.atan2(math.sin(self.X[4]), math.cos(self.X[4]))
+            self.P = (np.eye(5) - K @ H) @ self.P
+
+    def _apply_update(self, H, z, R):
+        y_res = z - H @ self.X
+        S = H @ self.P @ H.T + R
+        K = self.P @ H.T @ np.linalg.inv(S)
+        self.X += (K @ y_res).flatten()
+        self.X[4] = math.atan2(math.sin(self.X[4]), math.cos(self.X[4]))
+        I_KH = np.eye(5) - K @ H
+        self.P = I_KH @ self.P @ I_KH.T + K @ R @ K.T
+
+    def set_stationary_mode(self, is_stationary):
+        self.Q     = self.Q_static     if is_stationary else self.Q_moving
+        self.R_mag = self.R_mag_static if is_stationary else self.R_mag_moving
+
+    def reset_position(self):
+        """Zero x, y, vx, vy — keep yaw. Called between sub-tests."""
+        self.X[0] = 0.0; self.X[1] = 0.0
+        self.X[2] = 0.0; self.X[3] = 0.0
+        self.P[0,0]=1.0; self.P[1,1]=1.0
+        self.P[2,2]=0.5; self.P[3,3]=0.5
+
+    @property
+    def state(self):
+        return {
+            "x":   self.X[0], "y":   self.X[1],
+            "vx":  self.X[2], "vy":  self.X[3],
+            "yaw": math.degrees(self.X[4]),
+            "speed": math.hypot(self.X[2], self.X[3])
+        }
+
+
+# ─────────────────────────────────────────────
+# Stationary Detector
+# ─────────────────────────────────────────────
+class StationaryDetector:
+    def __init__(self, window=30, accel_thresh=0.05, gyro_thresh=0.015):
+        self.accel_buf    = deque(maxlen=window)
+        self.gyro_buf     = deque(maxlen=window)
+        self.accel_thresh = accel_thresh
+        self.gyro_thresh  = gyro_thresh
+
+    def update(self, accel, gyro):
+        self.accel_buf.append(accel[:2].copy())
+        self.gyro_buf.append(gyro[:3].copy())
+        if len(self.accel_buf) < self.accel_buf.maxlen:
+            return True
+        accel_var = np.max(np.var(np.array(self.accel_buf), axis=0))
+        gyro_var  = np.max(np.var(np.array(self.gyro_buf),  axis=0))
+        return accel_var < self.accel_thresh and gyro_var < self.gyro_thresh
+
+
+# ─────────────────────────────────────────────
+# EKF Loop — runs continuously in background
+# ─────────────────────────────────────────────
+class NavLoop:
+    """Wraps one IMU cycle. Call .tick(dt) each iteration."""
+    VELOCITY_FLOOR = 0.001
+
+    def __init__(self, imu, ekf, detector):
+        self.imu      = imu
+        self.ekf      = ekf
+        self.detector = detector
+
+    def tick(self, dt):
+        accel_raw  = self.imu.read_accel_raw()
+        gyro_raw   = self.imu.read_gyro_raw()
+        accel_cal  = accel_raw - self.imu.accel_bias
+        gyro_cal   = gyro_raw  - self.imu.gyro_bias
+
+        self.imu.update_tilt(accel_cal, gyro_cal, dt)
+        accel_lin  = self.imu.remove_gravity(accel_cal)
+
+        stationary = self.detector.update(accel_cal, gyro_cal)
+        self.ekf.set_stationary_mode(stationary)
+
+        if stationary:
+            self.imu.update_bias_adaptive(accel_cal, gyro_cal, alpha=0.005)
+
+        self.ekf.predict(accel_lin[:2], gyro_cal[2], dt)
+
+        if stationary:
+            self.ekf.update_zupt()
+            self.ekf.update_yaw_rate_zupt()
+            if abs(self.ekf.X[2]) < self.VELOCITY_FLOOR: self.ekf.X[2] = 0.0
+            if abs(self.ekf.X[3]) < self.VELOCITY_FLOOR: self.ekf.X[3] = 0.0
+
+        heading = self.imu.get_heading()
+        self.ekf.update_mag(heading)
+
+        return stationary
+
+
+# ─────────────────────────────────────────────
+# Phase 2 Test Runner
+# ─────────────────────────────────────────────
+class Phase2Test:
+    PASS = "✅ PASS"
+    FAIL = "❌ FAIL"
+
+    # Pass/fail thresholds
+    STRAIGHT_ERROR_M   = 0.20   # x must reach target ± this (m)
+    RETURN_ERROR_M     = 0.15   # x after return must be within this of 0
+    SIDE_DRIFT_M       = 0.08   # y must stay within ±this during straight drive
+    TURN_ERROR_DEG     = 10.0   # yaw change must be within ±this of target
+
+    def __init__(self):
+        self.imu      = GY87(bus_num=1)
+        self.ekf      = EKF()
+        self.detector = StationaryDetector()
+        self.motor    = MotorController()
+        self.nav      = NavLoop(self.imu, self.ekf, self.detector)
+        self.results  = []
+
+        self.logfile  = open("phase2_results.csv", "w")
+        self.logfile.write("t,test,status,x,y,vx,vy,yaw\n")
+
+    # ── Internal: run EKF loop for given duration, print at 2Hz ──────────
+    def _run_loop(self, duration_s, label, print_hz=2):
+        IMU_HZ         = 100
+        dt             = 1.0 / IMU_HZ
+        print_every    = IMU_HZ // print_hz
+        counter        = 0
+        t_start        = time.time()
+        t_prev         = t_start
+
+        while True:
+            t_now    = time.time()
+            elapsed  = t_now - t_start
+            if elapsed >= duration_s:
+                break
+
+            real_dt  = min(t_now - t_prev, 0.05)
+            t_prev   = t_now
+
+            stationary = self.nav.tick(real_dt)
+            state      = self.ekf.state
+
+            # CSV log every cycle
+            self.logfile.write(
+                f"{elapsed:.3f},{label},"
+                f"{'STILL' if stationary else 'MOVING'},"
+                f"{state['x']:.4f},{state['y']:.4f},"
+                f"{state['vx']:.4f},{state['vy']:.4f},"
+                f"{state['yaw']:.2f}\n"
+            )
+
+            # Console print at 2Hz
+            counter += 1
+            if counter >= print_every:
+                counter = 0
+                status_str = "STILL " if stationary else "MOVING"
+                print(
+                    f"  t={elapsed:6.2f}s | {status_str} | "
+                    f"x={state['x']:8.4f}m  "
+                    f"y={state['y']:8.4f}m  "
+                    f"vx={state['vx']:7.4f}m/s  "
+                    f"vy={state['vy']:7.4f}m/s  "
+                    f"yaw={state['yaw']:7.2f}°"
+                )
+
+            step_time  = time.time() - t_now
+            sleep_time = dt - step_time
+            if sleep_time > 0:
+                time.sleep(sleep_time)
+
+        return self.ekf.state
+
+    # ── Wait for car to fully stop (ZUPT confirmed) ───────────────────────
+    def _wait_stop(self, timeout=3.0):
+        self.motor.stop()
+        log.info("  Waiting for car to stop...")
+        self._run_loop(timeout, "STOPPING")
+
+    # ─────────────────────────────────────────────────────────────────────
+    # T1 — Forward 1 metre
+    # ─────────────────────────────────────────────────────────────────────
+    def test_forward(self, target_m=1.0, drive_s=4.0):
+        print("\n" + "─" * 65)
+        print(f"T1 — FORWARD {target_m}m  (driving {drive_s}s at {DRIVE_SPEED}% speed)")
+        print("  Expected: x grows to ~+1.0m, vx positive, y stays near 0")
+        print("─" * 65)
+
+        self.ekf.reset_position()
+        yaw_start = self.ekf.state["yaw"]
+
+        self.motor.forward()
+        state = self._run_loop(drive_s, "FORWARD")
+        self._wait_stop()
+
+        x_reached = state["x"]
+        y_drift   = abs(state["y"])
+        x_ok  = abs(x_reached - target_m) < self.STRAIGHT_ERROR_M
+        y_ok  = y_drift < self.SIDE_DRIFT_M
+
+        self.results.append(("T1a Forward x reached",  f"{x_reached:.4f}m",
+                              f"target {target_m}±{self.STRAIGHT_ERROR_M}m",
+                              self.PASS if x_ok  else self.FAIL))
+        self.results.append(("T1b Forward y drift",    f"{y_drift:.4f}m",
+                              f"limit <{self.SIDE_DRIFT_M}m",
+                              self.PASS if y_ok  else self.FAIL))
+        return state
+
+    # ─────────────────────────────────────────────────────────────────────
+    # T2 — Reverse back to origin
+    # ─────────────────────────────────────────────────────────────────────
+    def test_reverse(self, drive_s=4.0):
+        print("\n" + "─" * 65)
+        print(f"T2 — REVERSE back to origin  (driving {drive_s}s at {DRIVE_SPEED}% speed)")
+        print("  Expected: x decreases (vx negative), x returns to ~0.0m")
+        print("─" * 65)
+
+        # Note: do NOT reset position — we continue from T1 end position
+        self.motor.reverse()
+        state = self._run_loop(drive_s, "REVERSE")
+        self._wait_stop()
+
+        x_final  = state["x"]
+        x_ok     = abs(x_final) < self.RETURN_ERROR_M
+
+        self.results.append(("T2 Return-to-origin x",  f"{x_final:.4f}m",
+                              f"limit ±{self.RETURN_ERROR_M}m",
+                              self.PASS if x_ok else self.FAIL))
+        return state
+
+    # ─────────────────────────────────────────────────────────────────────
+    # T3 — 90° Left turn
+    # ─────────────────────────────────────────────────────────────────────
+    def test_turn_left(self, turn_s=3.5):
+        print("\n" + "─" * 65)
+        print(f"T3 — TURN LEFT ~90°  (turning {turn_s}s at {TURN_SPEED}% speed)")
+        print("  Expected: yaw increases by ~+90°, x/y position barely changes")
+        print("─" * 65)
+
+        self.ekf.reset_position()
+        yaw_before = self.ekf.state["yaw"]
+
+        self.motor.turn_left()
+        state = self._run_loop(turn_s, "TURN_LEFT")
+        self._wait_stop()
+
+        yaw_after  = state["yaw"]
+        yaw_change = yaw_after - yaw_before
+        # Normalise to [-180, 180]
+        yaw_change = (yaw_change + 180) % 360 - 180
+        yaw_ok     = abs(yaw_change - 90.0) < self.TURN_ERROR_DEG
+
+        self.results.append(("T3 Left turn yaw change", f"{yaw_change:+.2f}°",
+                              f"target +90°±{self.TURN_ERROR_DEG}°",
+                              self.PASS if yaw_ok else self.FAIL))
+        return state, yaw_before
+
+    # ─────────────────────────────────────────────────────────────────────
+    # T4 — 90° Right turn (undo the left turn)
+    # ─────────────────────────────────────────────────────────────────────
+    def test_turn_right(self, yaw_target, turn_s=3.5):
+        print("\n" + "─" * 65)
+        print(f"T4 — TURN RIGHT ~90°  (turning {turn_s}s at {TURN_SPEED}% speed)")
+        print(f"  Expected: yaw returns to ~{yaw_target:.1f}°  (original heading)")
+        print("─" * 65)
+
+        self.motor.turn_right()
+        state = self._run_loop(turn_s, "TURN_RIGHT")
+        self._wait_stop()
+
+        yaw_after  = state["yaw"]
+        yaw_change = yaw_after - self.ekf.state["yaw"]
+        yaw_change = (yaw_change + 180) % 360 - 180
+        yaw_err    = abs(yaw_after - yaw_target)
+        yaw_err    = min(yaw_err, 360 - yaw_err)   # handle wrap-around
+        yaw_ok     = yaw_err < self.TURN_ERROR_DEG
+
+        self.results.append(("T4 Right turn yaw return", f"{yaw_after:.2f}°",
+                              f"target {yaw_target:.1f}°±{self.TURN_ERROR_DEG}°",
+                              self.PASS if yaw_ok else self.FAIL))
+        return state
+
+    # ─────────────────────────────────────────────────────────────────────
+    # Main runner
+    # ─────────────────────────────────────────────────────────────────────
+    def run(self):
+        print("\n" + "=" * 65)
+        print("  PHASE 2 — CONTROLLED MOTION TEST")
+        print(f"  Drive speed: {DRIVE_SPEED}%   Turn speed: {TURN_SPEED}%")
+        print("  Coordinate: +X=forward  -X=reverse  +Y=left  -Y=right")
+        print("=" * 65)
+        print("\n  Starting in 5 seconds — place car on flat floor, facing forward")
+
+        for i in range(5, 0, -1):
+            print(f"  {i}...")
+            time.sleep(1)
+
+        try:
+            # ── 3s still warmup so EKF settles ──
+            print("\n  [Warmup — holding still 3s]")
+            self._run_loop(3.0, "WARMUP")
+            yaw_origin = self.ekf.state["yaw"]
+            print(f"  Initial yaw: {yaw_origin:.2f}°")
+
+            # ── Run tests ──
+            self.test_forward(target_m=1.0, drive_s=4.0)
+            time.sleep(1)
+            self.test_reverse(drive_s=4.0)
+            time.sleep(1)
+            _, yaw_before_turn = self.test_turn_left(turn_s=3.5)
+            time.sleep(1)
+            self.test_turn_right(yaw_target=yaw_before_turn, turn_s=3.5)
+
+        except KeyboardInterrupt:
+            log.info("Test interrupted.")
+        finally:
+            self.motor.cleanup()
+            self.logfile.close()
+
+        self._report()
+
+    # ─────────────────────────────────────────────────────────────────────
+    # Final report
+    # ─────────────────────────────────────────────────────────────────────
+    def _report(self):
+        print("\n" + "=" * 70)
+        print(f"  {'TEST':<35} {'VALUE':<20} {'LIMIT':<22} RESULT")
+        print("=" * 70)
+        passed = failed = 0
+        for name, value, limit, result in self.results:
+            print(f"  {name:<35} {value:<20} {limit:<22} {result}")
+            if result == self.PASS:  passed += 1
+            elif result == self.FAIL: failed += 1
+        print("=" * 70)
+        print(f"  SUMMARY: {passed} passed, {failed} failed")
+        if failed == 0:
+            print("  🎉 ALL TESTS PASSED — system ready for Phase 3")
+        else:
+            print("  ⚠  FAILURES DETECTED — see tuning guide below")
+            for name, value, limit, result in self.results:
+                if result == self.FAIL:
+                    if "x reached" in name:
+                        print(f"\n  [{name}] GUIDE:")
+                        print("  → x too low: drive_s too short OR DRIVE_SPEED too low")
+                        print("  → x too high: drive_s too long OR accel bias leaking")
+                        print("  → Try increasing drive_s by 1s and re-run")
+                    if "y drift" in name:
+                        print(f"\n  [{name}] GUIDE:")
+                        print("  → Motors not balanced (one faster than other)")
+                        print("  → Adjust DRIVE_SPEED per motor or physically align sensor")
+                    if "turn" in name.lower():
+                        print(f"\n  [{name}] GUIDE:")
+                        print("  → Adjust turn_s (more time = more degrees)")
+                        print("  → 1s change ≈ 25° at TURN_SPEED=25%")
+        print("=" * 70)
+        print("  Full log saved to: phase2_results.csv")
+
+
+# ─────────────────────────────────────────────
+# Entry Point
+# ─────────────────────────────────────────────
+if __name__ == "__main__":
+    test = Phase2Test()
+    test.run()
