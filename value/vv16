@@ -1,0 +1,102 @@
+ [Warmup — holding still 3s]
+  t=  0.54s | STILL  | x=  0.0000m  y= -0.0000m  vx=-0.0000m/s  vy= 0.0000m/s  yaw= -60.53°
+  t=  1.09s | STILL  | x= -0.0000m  y= -0.0000m  vx=-0.0000m/s  vy=-0.0000m/s  yaw= -66.16°
+  t=  1.64s | STILL  | x=  0.0000m  y= -0.0000m  vx=-0.0000m/s  vy=-0.0000m/s  yaw= -66.22°
+  t=  2.18s | STILL  | x=  0.0000m  y= -0.0000m  vx=-0.0000m/s  vy= 0.0000m/s  yaw= -65.76°
+  t=  2.73s | STILL  | x= -0.0000m  y= -0.0000m  vx= 0.0000m/s  vy= 0.0000m/s  yaw= -67.63°
+  Initial yaw: -67.50°
+
+─────────────────────────────────────────────────────────────────
+T1 — FORWARD 1.0m  (driving 4.0s at 60% speed)
+  Expected: x grows to ~+1.0m, vx positive, y stays near 0
+─────────────────────────────────────────────────────────────────
+  t=  0.51s | MOVING | x= -0.0293m  y= -0.0041m  vx=-0.0530m/s  vy= 0.0159m/s  yaw= -69.36°
+  t=  1.04s | STILL  | x= -0.0209m  y= -0.0045m  vx= 0.0000m/s  vy= 0.0000m/s  yaw= -53.28°
+  t=  1.58s | STILL  | x= -0.0209m  y= -0.0045m  vx=-0.0000m/s  vy= 0.0000m/s  yaw= -51.02°
+  t=  2.13s | STILL  | x= -0.0210m  y= -0.0045m  vx=-0.0010m/s  vy= 0.0000m/s  yaw= -49.45°
+  t=  2.67s | STILL  | x= -0.0211m  y= -0.0045m  vx= 0.0000m/s  vy=-0.0000m/s  yaw= -49.29°
+  t=  3.22s | STILL  | x= -0.0212m  y= -0.0045m  vx=-0.0000m/s  vy=-0.0000m/s  yaw= -49.46°
+  t=  3.78s | STILL  | x= -0.0211m  y= -0.0046m  vx= 0.0000m/s  vy= 0.0000m/s  yaw= -49.17°
+2026-03-01 23:19:07,729 [INFO]   Waiting for car to stop...
+  t=  0.54s | STILL  | x= -0.0212m  y= -0.0046m  vx= 0.0000m/s  vy= 0.0000m/s  yaw= -50.44°
+  t=  1.08s | STILL  | x= -0.0211m  y= -0.0046m  vx= 0.0000m/s  vy=-0.0000m/s  yaw= -49.68°
+  t=  1.63s | STILL  | x= -0.0211m  y= -0.0046m  vx=-0.0000m/s  vy=-0.0000m/s  yaw= -47.95°
+  t=  2.17s | STILL  | x= -0.0212m  y= -0.0046m  vx= 0.0000m/s  vy=-0.0000m/s  yaw= -48.29°
+  t=  2.72s | STILL  | x= -0.0213m  y= -0.0046m  vx= 0.0000m/s  vy= 0.0000m/s  yaw= -50.32°
+
+─────────────────────────────────────────────────────────────────
+T2 — REVERSE back to origin  (driving 4.0s at 60% speed)
+  Expected: x decreases (vx negative), x returns to ~0.0m
+─────────────────────────────────────────────────────────────────
+  t=  0.52s | MOVING | x=  0.0126m  y=  0.0022m  vx= 0.0998m/s  vy=-0.0275m/s  yaw= -47.17°
+  t=  1.04s | MOVING | x=  0.0790m  y=  0.0070m  vx= 0.1452m/s  vy= 0.0527m/s  yaw= -61.85°
+  t=  1.56s | MOVING | x=  0.1593m  y=  0.0534m  vx= 0.1717m/s  vy= 0.1100m/s  yaw= -79.32°
+  t=  2.10s | STILL  | x=  0.0305m  y= -0.0278m  vx= 0.0000m/s  vy= 0.0000m/s  yaw= -84.38°
+  t=  2.65s | STILL  | x=  0.0306m  y= -0.0278m  vx= 0.0000m/s  vy=-0.0000m/s  yaw= -86.58°
+  t=  3.17s | MOVING | x=  0.0338m  y= -0.0264m  vx= 0.0137m/s  vy=-0.0084m/s  yaw= -87.00°
+  t=  3.68s | MOVING | x=  0.0412m  y= -0.0238m  vx= 0.0176m/s  vy= 0.0027m/s  yaw= -88.98°
+2026-03-01 23:19:15,744 [INFO]   Waiting for car to stop...
+  t=  0.54s | STILL  | x=  0.0314m  y= -0.0234m  vx=-0.0000m/s  vy= 0.0000m/s  yaw= -88.07°
+  t=  1.08s | STILL  | x=  0.0314m  y= -0.0234m  vx=-0.0000m/s  vy= 0.0000m/s  yaw= -86.86°
+  t=  1.62s | STILL  | x=  0.0314m  y= -0.0234m  vx= 0.0000m/s  vy=-0.0000m/s  yaw= -87.04°
+  t=  2.17s | STILL  | x=  0.0314m  y= -0.0234m  vx= 0.0000m/s  vy= 0.0000m/s  yaw= -87.98°
+  t=  2.71s | STILL  | x=  0.0315m  y= -0.0234m  vx= 0.0000m/s  vy=-0.0000m/s  yaw= -88.85°
+
+─────────────────────────────────────────────────────────────────
+T3 — TURN LEFT ~90°  (turning 3.5s at 75% speed)
+  Expected: yaw increases by ~+90°, x/y position barely changes
+─────────────────────────────────────────────────────────────────
+  t=  0.52s | MOVING | x=  0.0025m  y=  0.0602m  vx= 0.0488m/s  vy= 0.1675m/s  yaw= -93.79°
+  t=  1.04s | MOVING | x=  0.0860m  y=  0.2006m  vx= 0.2708m/s  vy= 0.2946m/s  yaw= -76.01°
+  t=  1.55s | STILL  | x=  0.0093m  y=  0.1639m  vx=-0.0000m/s  vy=-0.0000m/s  yaw= -62.10°
+  t=  2.06s | STILL  | x=  0.0092m  y=  0.1639m  vx= 0.0000m/s  vy=-0.0000m/s  yaw= -57.88°
+  t=  2.57s | STILL  | x=  0.0092m  y=  0.1639m  vx= 0.0000m/s  vy= 0.0000m/s  yaw= -56.75°
+  t=  3.08s | STILL  | x=  0.0092m  y=  0.1639m  vx= 0.0000m/s  vy= 0.0000m/s  yaw= -58.27°
+2026-03-01 23:19:23,251 [INFO]   Waiting for car to stop...
+  t=  0.50s | STILL  | x=  0.0091m  y=  0.1640m  vx= 0.0000m/s  vy=-0.0000m/s  yaw= -58.91°
+  t=  1.01s | STILL  | x=  0.0091m  y=  0.1640m  vx= 0.0000m/s  vy=-0.0000m/s  yaw= -60.08°
+  t=  1.52s | STILL  | x=  0.0091m  y=  0.1640m  vx= 0.0000m/s  vy=-0.0000m/s  yaw= -60.20°
+  t=  2.06s | STILL  | x=  0.0091m  y=  0.1640m  vx=-0.0000m/s  vy= 0.0000m/s  yaw= -61.52°
+  t=  2.60s | STILL  | x=  0.0091m  y=  0.1640m  vx= 0.0000m/s  vy=-0.0000m/s  yaw= -58.80°
+
+─────────────────────────────────────────────────────────────────
+T4 — TURN RIGHT ~90°  (turning 3.5s at 75% speed)
+  Expected: yaw returns to ~-88.1°  (original heading)
+─────────────────────────────────────────────────────────────────
+  t=  0.51s | MOVING | x=  0.0932m  y=  0.0763m  vx= 0.2543m/s  vy=-0.2393m/s  yaw= -58.73°
+  t=  1.02s | MOVING | x=  0.2058m  y= -0.0432m  vx= 0.2046m/s  vy=-0.1788m/s  yaw= -62.25°
+  t=  1.53s | MOVING | x=  0.3078m  y=  0.0145m  vx= 0.2042m/s  vy= 0.2007m/s  yaw= -65.30°
+  t=  2.04s | MOVING | x=  0.3821m  y=  0.1088m  vx= 0.0983m/s  vy= 0.1698m/s  yaw= -69.23°
+  t=  2.55s | MOVING | x=  0.4261m  y=  0.1964m  vx= 0.0724m/s  vy= 0.1879m/s  yaw= -67.68°
+  t=  3.06s | MOVING | x=  0.4877m  y=  0.2802m  vx= 0.1328m/s  vy= 0.1410m/s  yaw= -67.77°
+2026-03-01 23:19:30,774 [INFO]   Waiting for car to stop...
+  t=  0.50s | MOVING | x=  0.5912m  y=  0.4994m  vx= 0.0248m/s  vy= 0.0037m/s  yaw= -67.25°
+  t=  1.00s | MOVING | x=  0.5952m  y=  0.4995m  vx= 0.0140m/s  vy= 0.0083m/s  yaw= -67.51°
+  t=  1.51s | STILL  | x=  0.5954m  y=  0.4993m  vx= 0.0000m/s  vy= 0.0000m/s  yaw= -68.10°
+  t=  2.06s | STILL  | x=  0.5954m  y=  0.4993m  vx= 0.0000m/s  vy= 0.0000m/s  yaw= -68.09°
+  t=  2.60s | STILL  | x=  0.5955m  y=  0.4993m  vx=-0.0000m/s  vy=-0.0000m/s  yaw= -67.17°
+
+======================================================================
+  TEST                                VALUE                LIMIT                  RESULT
+======================================================================
+  T1a Forward x reached               -0.0211m             target 1.0±0.2m        ❌ FAIL
+  T1b Forward y drift                 0.0046m              limit <0.08m           ✅ PASS
+  T2 Return-to-origin x               0.0314m              limit ±0.15m           ✅ PASS
+  T3 Left turn yaw change             +28.82°              target +90°±10.0°      ❌ FAIL
+  T4 Right turn yaw return            -67.12°              target -88.1°±10.0°    ❌ FAIL
+======================================================================
+  SUMMARY: 2 passed, 3 failed
+  ⚠  FAILURES DETECTED — see tuning guide below
+
+  [T1a Forward x reached] GUIDE:
+  → x too low: drive_s too short OR DRIVE_SPEED too low
+  → x too high: drive_s too long OR accel bias leaking
+  → Try increasing drive_s by 1s and re-run
+
+  [T3 Left turn yaw change] GUIDE:
+  → Adjust turn_s (more time = more degrees)
+  → 1s change ≈ 25° at TURN_SPEED=25%
+
+  [T4 Right turn yaw return] GUIDE:
+  → Adjust turn_s (more time = more degrees)
+  → 1s change ≈ 25° at TURN_SPEED=25%
