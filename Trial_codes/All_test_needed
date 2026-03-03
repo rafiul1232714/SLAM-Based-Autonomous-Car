@@ -1,0 +1,10 @@
+1. zero valocity test
+2. linear motion test
+Test 3 — Turning validation
+Verify the robot can turn accurately to specific headings (90°, 180°, 270°) and stop within ±3° of target. This uses the same EKF yaw but now actually commands turns instead of suppressing them.
+Test 4 — Square path
+Drive a 1m × 1m square and return to origin. This combines linear motion + turning. Pass criteria would be final position within 10cm of start and final yaw within 5° of start heading.
+Test 5 — Obstacle avoidance
+Drive toward a known obstacle, detect it with LiDAR, navigate around it, continue to target. This is where the full sensor fusion pays off.
+Test 6 — Full navigation
+Give the robot a target coordinate (x, y) and let it plan and execute the path autonomously using EKF position + LiDAR for obstacle detection.
