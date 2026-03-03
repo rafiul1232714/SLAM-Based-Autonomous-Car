@@ -1,0 +1,28 @@
+TEST 2 v4 — RESULTS
+================================================================================
+  METRIC                                   VALUE                        LIMIT       RESULT
+================================================================================
+  [!!]  M1  EKF peak x  (1 m forward)          0.397 m                      0.85–1.2 m  FAIL
+  [OK]  M2  Peak vx  (IMU motion)              0.2952 m/s                   >= 0.05 m/s  PASS
+  [!!]  M3  LiDAR vs EKF displacement          LiDAR=1.611m  EKF=0.397m  diff=1.215m diff < 0.2m  FAIL
+  [!!]  M4  Yaw drift                          29.35°                       < 5.0°      FAIL
+  [!!]  M5  Final return |x|                   0.3107 m                     < 0.08 m    FAIL
+  [!!]  M6  Final speed (ZUPT)                 0.66764 m/s                  < 0.01 m/s  FAIL
+  [!!]  !! ABORTED                             OBSTACLE 278 mm                          FAIL
+================================================================================
+  SUMMARY: 1 passed,  6 failed
+
+  NEXT STEPS:
+
+  M3 — LiDAR/EKF disagree.
+       Fix M4 first — straight driving fixes M3 automatically.
+
+  M4 — Yaw still drifting.
+       Current SWAP=False  KP=12.0
+       Step 1: try --swap  (swaps left/right motor channels)
+       Step 2: try --kp 12.0 for stronger correction
+       Step 3: set SWAP_MOTORS / GYRO_STEER_KP in this file
+
+  M5 — Return position off.
+       Time-matched return is active.
+       Fix M4 first — curved path is the root cause.
