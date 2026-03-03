@@ -1,0 +1,353 @@
+#!/usr/bin/env python3
+"""
+Phase 2B — Go 1m Forward and Back Using LiDAR + IMU (PASS/FAIL)
+===============================================================
+Setup:
+  - Put a flat wall/box straight in front of the robot.
+  - Ensure starting LiDAR distance D0 is >= 1500 mm (recommended).
+  - Robot drives forward until distance ~ D0 - 1000 mm, then drives back to ~ D0.
+
+PASS/FAIL Criteria (tunable below):
+  - Forward stop error <= FORWARD_TOL_MM
+  - Return stop error  <= RETURN_TOL_MM
+  - Too many invalid LiDAR readings => FAIL
+  - Excessive yaw-rate while "straight" => FAIL
+  - Timeout => FAIL
+
+Run:
+  python3 phase2_go_1m_and_back_test.py
+Stop anytime: Ctrl+C
+"""
+
+import time
+import math
+import csv
+import numpy as np
+import smbus2
+import RPi.GPIO as GPIO
+
+# ------------------ Motor Driver ------------------
+class DualMotorDriver:
+    def __init__(self, ENA=12, IN1=13, IN2=11, ENB=19, IN3=16, IN4=18, pwm_hz=20000):
+        self.ENA, self.IN1, self.IN2 = ENA, IN1, IN2
+        self.ENB, self.IN3, self.IN4 = ENB, IN3, IN4
+        GPIO.setmode(GPIO.BCM)
+        for p in [ENA, IN1, IN2, ENB, IN3, IN4]:
+            GPIO.setup(p, GPIO.OUT)
+            GPIO.output(p, GPIO.LOW)
+        self.pwmA = GPIO.PWM(self.ENA, pwm_hz)
+        self.pwmB = GPIO.PWM(self.ENB, pwm_hz)
+        self.pwmA.start(0)
+        self.pwmB.start(0)
+
+    def _dir(self, in1, in2, forward: bool):
+        GPIO.output(in1, GPIO.HIGH if forward else GPIO.LOW)
+        GPIO.output(in2, GPIO.LOW  if forward else GPIO.HIGH)
+
+    def set(self, left_pwm, right_pwm):
+        left_pwm  = max(-100.0, min(100.0, float(left_pwm)))
+        right_pwm = max(-100.0, min(100.0, float(right_pwm)))
+        self._dir(self.IN1, self.IN2, forward=(left_pwm >= 0))
+        self._dir(self.IN3, self.IN4, forward=(right_pwm >= 0))
+        self.pwmA.ChangeDutyCycle(abs(left_pwm))
+        self.pwmB.ChangeDutyCycle(abs(right_pwm))
+
+    def stop(self):
+        self.set(0, 0)
+
+    def cleanup(self):
+        try:
+            self.stop()
+            self.pwmA.stop()
+            self.pwmB.stop()
+        finally:
+            GPIO.cleanup()
+
+# ------------------ IMU (GY-87 minimal) ------------------
+MPU6050_ADDR  = 0x68
+PWR_MGMT_1    = 0x6B
+ACCEL_XOUT_H  = 0x3B
+GYRO_XOUT_H   = 0x43
+ACCEL_CONFIG  = 0x1C
+GYRO_CONFIG   = 0x1B
+
+class GY87:
+    def __init__(self, bus_num=1):
+        self.bus = smbus2.SMBus(bus_num)
+        self.bus.write_byte_data(MPU6050_ADDR, PWR_MGMT_1, 0x00)
+        time.sleep(0.1)
+        self.bus.write_byte_data(MPU6050_ADDR, ACCEL_CONFIG, 0x00)
+        self.bus.write_byte_data(MPU6050_ADDR, GYRO_CONFIG,  0x00)
+        time.sleep(0.05)
+        self.gyro_bias  = np.zeros(3)
+        self.accel_bias = np.zeros(3)
+        self.calibrate(300)
+
+    def _read_word(self, addr, reg):
+        high = self.bus.read_byte_data(addr, reg)
+        low  = self.bus.read_byte_data(addr, reg + 1)
+        val  = (high << 8) | low
+        return val - 65536 if val > 32767 else val
+
+    def read_accel_raw(self):
+        ax = self._read_word(MPU6050_ADDR, ACCEL_XOUT_H)
+        ay = self._read_word(MPU6050_ADDR, ACCEL_XOUT_H + 2)
+        az = self._read_word(MPU6050_ADDR, ACCEL_XOUT_H + 4)
+        return np.array([ax, ay, az]) / 16384.0 * 9.80665
+
+    def read_gyro_raw(self):
+        gx = self._read_word(MPU6050_ADDR, GYRO_XOUT_H)
+        gy = self._read_word(MPU6050_ADDR, GYRO_XOUT_H + 2)
+        gz = self._read_word(MPU6050_ADDR, GYRO_XOUT_H + 4)
+        return np.array([gx, gy, gz]) / 131.0 * (math.pi / 180.0)
+
+    def calibrate(self, samples=300):
+        print(f"[IMU] Calibrating {samples} samples — keep still...")
+        g_sum = np.zeros(3)
+        a_sum = np.zeros(3)
+        for _ in range(samples):
+            g_sum += self.read_gyro_raw()
+            a_sum += self.read_accel_raw()
+            time.sleep(0.005)
+        self.gyro_bias  = g_sum / samples
+        self.accel_bias = a_sum / samples
+        self.accel_bias[2] -= 9.80665
+        print("[IMU] gyro_bias rad/s:", np.round(self.gyro_bias, 5))
+
+# ------------------ LiDAR (VL53L1X) ------------------
+class LidarVL53L1X:
+    def __init__(self, i2c_bus=1):
+        import vl53l1x
+        self._vl53 = vl53l1x.VL53L1X(i2c_bus=i2c_bus, i2c_address=0x29)
+        self._vl53.open()
+        self._vl53.set_timing_budget(50_000)
+        self._vl53.start_ranging(1)
+
+    def read_mm(self):
+        return int(self._vl53.get_distance())
+
+    def close(self):
+        try:
+            self._vl53.stop_ranging()
+        finally:
+            self._vl53.close()
+
+# ------------------ Helpers ------------------
+def clamp(x, lo, hi):
+    return lo if x < lo else hi if x > hi else x
+
+class LPF:
+    def __init__(self, alpha=0.2):
+        self.alpha = alpha
+        self.y = None
+    def update(self, x):
+        if x is None:
+            return self.y
+        if self.y is None:
+            self.y = float(x)
+        else:
+            self.y = self.y + self.alpha * (float(x) - self.y)
+        return self.y
+
+# ------------------ Main Test ------------------
+def main():
+    # Pins (edit if needed)
+    PINS = dict(ENA=12, IN1=13, IN2=11, ENB=19, IN3=16, IN4=18)
+
+    # ---- Test parameters (tune here) ----
+    TARGET_MOVE_MM      = 1000      # 1 meter
+    FORWARD_TOL_MM      = 30        # must stop within ±30mm at forward target
+    RETURN_TOL_MM       = 30        # must return within ±30mm of start
+    MIN_START_DIST_MM   = 1500      # recommended start distance to wall
+    MAX_TEST_TIME_S     = 25.0      # overall timeout
+
+    # Motor control settings
+    PWM_MIN             = 22.0      # minimum to overcome friction
+    PWM_MAX             = 55.0      # cap speed for accuracy
+    KP_MM_TO_PWM        = 0.04      # proportional: error(mm)*KP -> pwm
+    PWM_BRAKE_TIME      = 0.20      # seconds stop before switching direction
+
+    # Sensor quality criteria
+    MAX_INVALID_READS   = 30        # too many invalid lidar samples => FAIL
+    STUCK_WINDOW        = 25        # samples
+    STUCK_EPS_MM        = 2         # mm (if it repeats too perfectly => stuck)
+    YAW_RATE_LIMIT      = 0.20      # rad/s average magnitude while moving straight
+
+    SAMPLE_HZ = 40
+    DT = 1.0 / SAMPLE_HZ
+
+    motors = DualMotorDriver(**PINS)
+    imu    = GY87(bus_num=1)
+    lidar  = LidarVL53L1X(i2c_bus=1)
+    dist_lpf = LPF(alpha=0.25)
+
+    print("\n[TEST] Place robot facing a flat wall/box. Keep it straight.")
+    print("[TEST] Sampling LiDAR to get stable start distance (2 seconds)...")
+
+    # --- measure D0 ---
+    d_samples = []
+    t0 = time.time()
+    while time.time() - t0 < 2.0:
+        d = lidar.read_mm()
+        if 50 < d < 4000:
+            d_samples.append(d)
+        time.sleep(0.02)
+
+    if len(d_samples) < 10:
+        print("[FAIL] LiDAR not giving valid readings.")
+        motors.cleanup()
+        lidar.close()
+        return
+
+    D0 = int(np.median(d_samples))
+    print(f"[TEST] Start distance D0 = {D0} mm")
+
+    if D0 < MIN_START_DIST_MM:
+        print(f"[FAIL] Start distance too small (<{MIN_START_DIST_MM} mm). Move robot back.")
+        motors.cleanup()
+        lidar.close()
+        return
+
+    D_target_forward = D0 - TARGET_MOVE_MM
+    print(f"[TEST] Forward target distance = {D_target_forward} mm (move ~1m forward)")
+    print("[TEST] Starting in 2 seconds...\n")
+    time.sleep(2.0)
+
+    # Logging
+    logname = "phase2_1m_forward_back_log.csv"
+    f = open(logname, "w", newline="")
+    w = csv.writer(f)
+    w.writerow(["t","phase","D0","dist_mm_raw","dist_mm_filt","target_mm","err_mm","pwm_cmd","gz_rad_s"])
+
+    invalid = 0
+    stuck_buf = []
+    gz_moving = []
+
+    def read_dist_filtered():
+        nonlocal invalid, stuck_buf
+        d_raw = lidar.read_mm()
+        if not (50 < d_raw < 4000):
+            invalid += 1
+            return None, dist_lpf.update(None), d_raw
+        d_f = dist_lpf.update(d_raw)
+        stuck_buf.append(d_raw)
+        if len(stuck_buf) > STUCK_WINDOW:
+            stuck_buf.pop(0)
+        return d_raw, d_f, d_raw
+
+    def drive_to_target(target_mm, phase_name, direction_forward: bool):
+        nonlocal gz_moving
+        phase_start = time.time()
+        while True:
+            t = time.time() - test_start
+            if t > MAX_TEST_TIME_S:
+                return False, "timeout"
+
+            # IMU gyro z (sanity: straightness)
+            gyro = imu.read_gyro_raw() - imu.gyro_bias
+            gz = float(gyro[2])
+
+            # LiDAR
+            d_raw, d_filt, d_any = read_dist_filtered()
+            if d_filt is None:
+                d_filt = d_any
+
+            # Error definition:
+            # If moving forward toward wall => distance should decrease toward target
+            err = (d_filt - target_mm) if d_filt is not None else 9999.0
+
+            # Stop condition
+            if d_filt is not None and abs(err) <= (FORWARD_TOL_MM if phase_name=="FORWARD" else RETURN_TOL_MM):
+                motors.stop()
+                w.writerow([f"{t:.3f}", phase_name, D0, d_raw, f"{d_filt:.2f}", target_mm, f"{err:.2f}", 0.0, f"{gz:.5f}"])
+                time.sleep(PWM_BRAKE_TIME)
+                return True, "reached"
+
+            # Compute PWM (P-control)
+            pwm = abs(err) * KP_MM_TO_PWM
+            pwm = clamp(pwm, PWM_MIN, PWM_MAX)
+
+            # Command
+            cmd = +pwm if direction_forward else -pwm
+            motors.set(cmd, cmd)
+
+            # log gz while moving
+            gz_moving.append(abs(gz))
+
+            w.writerow([f"{t:.3f}", phase_name, D0, d_raw, f"{d_filt:.2f}", target_mm, f"{err:.2f}", f"{cmd:.2f}", f"{gz:.5f}"])
+
+            time.sleep(DT)
+
+    # Start test timer
+    test_start = time.time()
+    pass_fail = True
+    fail_reason = ""
+
+    try:
+        # --- FORWARD 1m ---
+        ok, reason = drive_to_target(D_target_forward, "FORWARD", direction_forward=True)
+        if not ok:
+            pass_fail = False
+            fail_reason = f"Forward phase failed: {reason}"
+
+        motors.stop()
+        time.sleep(PWM_BRAKE_TIME)
+
+        # --- BACK to start ---
+        if pass_fail:
+            ok, reason = drive_to_target(D0, "BACK", direction_forward=False)
+            if not ok:
+                pass_fail = False
+                fail_reason = f"Back phase failed: {reason}"
+
+    except KeyboardInterrupt:
+        pass_fail = False
+        fail_reason = "interrupted by user"
+    finally:
+        motors.stop()
+        motors.cleanup()
+        lidar.close()
+        f.close()
+
+    # ---- Post checks ----
+    # stuck detection: if last window has near-identical values -> likely stuck
+    stuck = False
+    if len(stuck_buf) >= STUCK_WINDOW:
+        if (max(stuck_buf) - min(stuck_buf)) <= STUCK_EPS_MM:
+            stuck = True
+
+    yaw_bad = False
+    if len(gz_moving) > 10:
+        gz_mean = float(np.mean(gz_moving))
+        yaw_bad = gz_mean > YAW_RATE_LIMIT
+    else:
+        gz_mean = 0.0
+
+    if invalid > MAX_INVALID_READS:
+        pass_fail = False
+        fail_reason = f"Too many invalid LiDAR reads: {invalid}"
+    if stuck:
+        pass_fail = False
+        fail_reason = "LiDAR appears stuck (distance not changing)"
+    if yaw_bad:
+        pass_fail = False
+        fail_reason = f"Too much yaw while 'straight' (mean |gz|={gz_mean:.3f} rad/s)"
+
+    # ---- Final report ----
+    print("\n" + "="*60)
+    print("PHASE 2B RESULT: 1m forward + 1m back")
+    print("="*60)
+    print(f"Start distance D0: {D0} mm")
+    print(f"Forward target:    {D_target_forward} mm")
+    print(f"Invalid reads:     {invalid}")
+    print(f"Mean |gz| moving:  {gz_mean:.3f} rad/s")
+    print(f"Log file:          {logname}")
+    print("-"*60)
+    if pass_fail:
+        print("✅ PASS — robot achieved 1m forward and returned using LiDAR control")
+    else:
+        print("❌ FAIL —", fail_reason)
+    print("="*60)
+
+if __name__ == "__main__":
+    main()
