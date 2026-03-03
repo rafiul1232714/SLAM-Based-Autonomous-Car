@@ -1,0 +1,29 @@
+===============================================================================
+  TEST 2 v7 — RESULTS
+================================================================================
+  METRIC                                 VALUE                        LIMIT        RESULT
+================================================================================
+  [OK]  M1  EKF peak x                       1.002m                       0.85–1.2m    PASS
+  [OK]  M2  Peak vx                          0.3353m/s                    >=0.05m/s    PASS
+  [!!]  M3  LiDAR vs EKF                     LiDAR=1.338m EKF=1.002m diff=0.337m diff<0.2m    FAIL
+  [!!]  M4  Yaw drift                        8.98°                        <5.0°        FAIL
+  [!!]  M5  Final return |x|                 0.2753m                      <0.08m       FAIL
+  [OK]  M6  Final speed                      0.00000m/s                   <0.01m/s     PASS
+================================================================================
+  SUMMARY: 3 passed,  3 failed
+
+  Current: LEFT=50%  RIGHT=57%  boost=+7
+
+  M3 — Fix M4 first. Ensure solid wall >1.5m ahead.
+
+  M4 — 8.98°
+       Still curves RIGHT → python3 test2_v7.py --boost 15
+       Still curves RIGHT → python3 test2_v7.py --boost 20
+       Now  curves LEFT  → python3 test2_v7.py --boost 5
+       Once straight set RIGHT_BOOST in this file.
+
+  M5 — Fix M4 first. Time-matched return is active.
+================================================================================
+
+  LEFT=50%  RIGHT=57%  boost=+7  LIDAR_FWD=180°
+  Log → test2_results.csv
