@@ -1,0 +1,38 @@
+
+================================================================================
+  TEST 2 — LINEAR MOTION VALIDATION — RESULTS  (FIXED v2)
+================================================================================
+  METRIC                                   VALUE                        LIMIT       RESULT
+================================================================================
+  [OK]  M1  EKF peak x  (1 m forward)          1.007 m                      0.85 – 1.2 m  PASS
+  [OK]  M2  Peak vx  (IMU detects motion)      0.5058 m/s                   >= 0.05 m/s  PASS
+  [!!]  M3  LiDAR vs EKF displacement          LiDAR=0.720 m  EKF=1.007 m  diff=0.287 m diff < 0.2 m  FAIL
+  [!!]  M4  Yaw drift  (straight line)         13.20°                       < 5.0°      FAIL
+  [!!]  M5  Final return position  |x|         0.1725 m                     < 0.08 m    FAIL
+  [OK]  M6  Final speed  (ZUPT working)        0.00000 m/s                  < 0.01 m/s  PASS
+================================================================================
+  SUMMARY:  3 passed,  3 failed
+
+  FAILURES — fix guide:
+
+  M3 — LiDAR/EKF still disagree.
+       Current LIDAR_FORWARD_ANGLE = 180°
+       If LiDAR=forward displacement is NEGATIVE → flip to 0°.
+       If LiDAR=forward displacement is POSITIVE → flip to 180°.
+       Ensure a solid wall/box is > 1.5 m directly ahead.
+
+  M4 — Yaw still drifting > 5°.
+       Current PWM_TRIM = +0
+       Robot veers LEFT  → increase PWM_TRIM (try +3 to +8).
+       Robot veers RIGHT → decrease PWM_TRIM (try -3 to -8).
+       Also confirm wheel alignment is straight.
+
+  M5 — Return position still off.
+       Fix M4 yaw drift first — that is the primary cause.
+       Also try increasing STILL_BETWEEN_S beyond 4.0 s.
+================================================================================
+
+  Log saved → test2_results.csv
+  PWM_SPEED=50%  TRIM=+0  LIDAR_FWD=180°  ENA=12 IN1=13 IN2=11 IN3=16 IN4=15 ENB=35
+
+>>> 
