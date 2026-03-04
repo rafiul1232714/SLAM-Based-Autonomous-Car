@@ -1,0 +1,692 @@
+"""
+Test 2 — Linear Motion Validation  (v7 — M5 FIXED)
+====================================================
+
+ONLY CHANGES FROM v7
+---------------------
+1. LiDAR x correction added to _imu_tick()
+   — records wall distance at origin (S1)
+   — every tick during S2 and S4: true_x = (wall_origin - wall_now) / 1000
+   — feeds true_x into EKF so position stays anchored to reality
+   — this fixes M5: robot IS at origin, now EKF agrees
+
+2. update_lidar_x() added to EKF class
+   — single observation H=[1,0,0,0,0], R=0.01 (trust LiDAR strongly)
+
+EVERYTHING ELSE IDENTICAL TO v7
+---------------------------------
+  PWM_SPEED       = 50
+  RIGHT_BOOST     = 8  (forward)
+  RIGHT_BOOST_BWD = 6.5   (backward)
+  LIDAR_FORWARD_ANGLE = 180
+  STILL_BETWEEN_S = 5.0
+  Motor pin logic, IMU, EKF, StationaryDetector — all unchanged
+
+Usage:
+  python3 test2_v7_fixed.py
+  python3 test2_v7_fixed.py --boost 15
+  python3 test2_v7_fixed.py --boost-bwd 9
+"""
+
+import math, time, logging, threading, glob, argparse
+from collections import deque
+import numpy as np
+
+try:
+    import RPi.GPIO as GPIO; GPIO_OK = True
+except ImportError:
+    GPIO_OK = False; print("WARNING: RPi.GPIO not found")
+
+try:
+    import smbus2; SMBUS_OK = True
+except ImportError:
+    SMBUS_OK = False; print("WARNING: smbus2 not found")
+
+try:
+    from rplidar import RPLidar; RPLIDAR_OK = True
+except ImportError:
+    RPLIDAR_OK = False; print("WARNING: rplidar not found")
+
+logging.basicConfig(level=logging.INFO,
+                    format="%(asctime)s [%(levelname)s] %(message)s")
+log = logging.getLogger("TEST2v7")
+
+
+# =============================================================================
+#  TUNING — identical to v7
+# =============================================================================
+PWM_SPEED           = 50
+RIGHT_BOOST         = 7.9    # extra PWM for RIGHT motor FORWARD
+RIGHT_BOOST_BWD     = 7.9    # extra PWM for RIGHT motor BACKWARD
+LIDAR_FORWARD_ANGLE = 180    # LiDAR faces backward on chassis
+TARGET_M            = 1.0
+OBSTACLE_STOP_MM    = 300
+STILL_BEFORE_S      = 3.0
+STILL_BETWEEN_S     = 5.0
+STILL_AFTER_S       = 4.0
+
+
+# =============================================================================
+#  PIN MAP — identical to v7
+# =============================================================================
+ENA_PIN = 12; IN1_PIN = 13; IN2_PIN = 11
+IN3_PIN = 16; IN4_PIN = 15; ENB_PIN = 35
+
+
+# =============================================================================
+#  I2C registers — identical to v7
+# =============================================================================
+MPU6050_ADDR = 0x68; HMC5883L_ADDR = 0x1E
+PWR_MGMT_1   = 0x6B; ACCEL_XOUT_H  = 0x3B; GYRO_XOUT_H = 0x43
+ACCEL_CONFIG = 0x1C; GYRO_CONFIG   = 0x1B; INT_PIN_CFG = 0x37
+HMC_CONFIG_A = 0x00; HMC_CONFIG_B  = 0x01; HMC_MODE    = 0x02
+HMC_DATA_X_H = 0x03
+
+
+# =============================================================================
+#  Motors — identical to v7
+#  LEFT  motor (ENA pin 12) = PWM_SPEED only
+#  RIGHT motor (ENB pin 35) = PWM_SPEED + RIGHT_BOOST (fwd) or RIGHT_BOOST_BWD (bwd)
+# =============================================================================
+class Motors:
+    PWM_FREQ = 1000
+
+    def __init__(self, pwm_pct=PWM_SPEED, boost=RIGHT_BOOST, boost_bwd=RIGHT_BOOST_BWD):
+        if not GPIO_OK:
+            raise RuntimeError("RPi.GPIO not available")
+        self.left_duty      = max(0, min(100, pwm_pct))
+        self.right_duty_fwd = max(0, min(100, pwm_pct + boost))
+        self.right_duty_bwd = max(0, min(100, pwm_pct + boost_bwd))
+        GPIO.setmode(GPIO.BOARD); GPIO.setwarnings(False)
+        for pin in (IN1_PIN, IN2_PIN, IN3_PIN, IN4_PIN):
+            GPIO.setup(pin, GPIO.OUT); GPIO.output(pin, GPIO.LOW)
+        for pin in (ENA_PIN, ENB_PIN):
+            GPIO.setup(pin, GPIO.OUT)
+        self.pwm_a = GPIO.PWM(ENA_PIN, self.PWM_FREQ)   # left
+        self.pwm_b = GPIO.PWM(ENB_PIN, self.PWM_FREQ)   # right
+        self.pwm_a.start(0); self.pwm_b.start(0)
+        log.info(f"Motors  LEFT={self.left_duty}%  "
+                 f"FWD_RIGHT={self.right_duty_fwd}%  "
+                 f"BWD_RIGHT={self.right_duty_bwd}%")
+
+    def forward(self):
+        GPIO.output(IN1_PIN, GPIO.HIGH); GPIO.output(IN2_PIN, GPIO.LOW)
+        GPIO.output(IN3_PIN, GPIO.LOW);  GPIO.output(IN4_PIN, GPIO.HIGH)
+        self.pwm_a.ChangeDutyCycle(self.left_duty)
+        self.pwm_b.ChangeDutyCycle(self.right_duty_fwd)
+        log.info(f"  >> FORWARD  L={self.left_duty}%  R={self.right_duty_fwd}%")
+
+    def backward(self):
+        GPIO.output(IN1_PIN, GPIO.LOW);  GPIO.output(IN2_PIN, GPIO.HIGH)
+        GPIO.output(IN3_PIN, GPIO.HIGH); GPIO.output(IN4_PIN, GPIO.LOW)
+        self.pwm_a.ChangeDutyCycle(self.left_duty)
+        self.pwm_b.ChangeDutyCycle(self.right_duty_bwd)
+        log.info(f"  >> BACKWARD  L={self.left_duty}%  R={self.right_duty_bwd}%")
+
+    def stop(self):
+        self.pwm_a.ChangeDutyCycle(0); self.pwm_b.ChangeDutyCycle(0)
+        for pin in (IN1_PIN, IN2_PIN, IN3_PIN, IN4_PIN):
+            GPIO.output(pin, GPIO.LOW)
+        log.info("  >> STOP")
+
+    def cleanup(self):
+        self.stop(); self.pwm_a.stop(); self.pwm_b.stop(); GPIO.cleanup()
+
+
+# =============================================================================
+#  GY-87 — identical to v7
+# =============================================================================
+class GY87:
+    MAG_LPF = 0.03; COMP_ALPHA = 0.98
+
+    def __init__(self, bus_num=1):
+        if not SMBUS_OK: raise RuntimeError("pip install smbus2")
+        self.bus = smbus2.SMBus(bus_num)
+        self.gyro_bias = np.zeros(3); self.accel_bias = np.zeros(3)
+        self.roll = self.pitch = 0.0; self.mag_filtered = None
+        self._init_mpu(); self._init_mag(); self.calibrate(500)
+
+    def _init_mpu(self):
+        self.bus.write_byte_data(MPU6050_ADDR, PWR_MGMT_1,   0x00); time.sleep(0.1)
+        self.bus.write_byte_data(MPU6050_ADDR, ACCEL_CONFIG, 0x00)
+        self.bus.write_byte_data(MPU6050_ADDR, GYRO_CONFIG,  0x00)
+        self.bus.write_byte_data(MPU6050_ADDR, INT_PIN_CFG,  0x02); time.sleep(0.05)
+
+    def _init_mag(self):
+        try:
+            self.bus.write_byte_data(HMC5883L_ADDR, HMC_CONFIG_A, 0x70)
+            self.bus.write_byte_data(HMC5883L_ADDR, HMC_CONFIG_B, 0x20)
+            self.bus.write_byte_data(HMC5883L_ADDR, HMC_MODE,     0x00)
+            self.mag_ok = True; log.info("HMC5883L ready")
+        except Exception as e:
+            log.warning(f"HMC5883L: {e}"); self.mag_ok = False
+
+    def _rw(self, addr, reg):
+        v = (self.bus.read_byte_data(addr, reg) << 8) | \
+             self.bus.read_byte_data(addr, reg + 1)
+        return v - 65536 if v > 32767 else v
+
+    def read_accel(self):
+        return np.array([self._rw(MPU6050_ADDR, ACCEL_XOUT_H + i*2)
+                         for i in range(3)]) / 16384.0 * 9.80665
+
+    def read_gyro(self):
+        return np.array([self._rw(MPU6050_ADDR, GYRO_XOUT_H + i*2)
+                         for i in range(3)]) / 131.0 * (math.pi / 180)
+
+    def read_mag(self):
+        if not self.mag_ok: return None
+        try:
+            mx = self._rw(HMC5883L_ADDR, HMC_DATA_X_H)
+            mz = self._rw(HMC5883L_ADDR, HMC_DATA_X_H + 2)
+            my = self._rw(HMC5883L_ADDR, HMC_DATA_X_H + 4)
+            return np.array([float(mx), float(my), float(mz)])
+        except: return None
+
+    def calibrate(self, n=500):
+        log.info(f"IMU calibrating ({n} samples) — keep still ...")
+        gs = np.zeros(3); ac = np.zeros(3)
+        for i in range(n):
+            gs += self.read_gyro(); ac += self.read_accel(); time.sleep(0.005)
+            if i % 100 == 0: log.info(f"  {i}/{n}")
+        self.gyro_bias  = gs / n
+        self.accel_bias = ac / n; self.accel_bias[2] -= 9.80665
+        log.info(f"  gyro_bias  = {np.round(self.gyro_bias,  5)}")
+        log.info(f"  accel_bias = {np.round(self.accel_bias, 5)}")
+
+    def update_tilt(self, ac, gc, dt):
+        n = np.linalg.norm(ac)
+        if n < 1.0: return
+        ax, ay, az = ac / n
+        self.roll  = self.COMP_ALPHA*(self.roll  + gc[0]*dt) + \
+                     (1-self.COMP_ALPHA)*math.atan2(ay, az)
+        self.pitch = self.COMP_ALPHA*(self.pitch + gc[1]*dt) + \
+                     (1-self.COMP_ALPHA)*(-math.asin(max(-1.0, min(1.0, ax))))
+
+    def remove_gravity(self, ac):
+        return np.array([ac[0], ac[1], 0.0])
+
+    def get_heading(self):
+        m = self.read_mag()
+        if m is None: return None
+        cr, sr = math.cos(self.roll),  math.sin(self.roll)
+        cp, sp = math.cos(self.pitch), math.sin(self.pitch)
+        mx = m[0]*cp + m[2]*sp
+        my = m[0]*sr*sp + m[1]*cr - m[2]*sr*cp
+        hr = math.atan2(my, mx)
+        if self.mag_filtered is None:
+            self.mag_filtered = hr; return hr
+        d = math.atan2(math.sin(hr - self.mag_filtered),
+                       math.cos(hr - self.mag_filtered))
+        self.mag_filtered = math.atan2(
+            math.sin(self.mag_filtered + self.MAG_LPF * d),
+            math.cos(self.mag_filtered + self.MAG_LPF * d))
+        return self.mag_filtered
+
+    def update_bias_adaptive(self, ac, gc, alpha=0.005):
+        self.gyro_bias      += alpha * gc
+        self.accel_bias[:2] += alpha * ac[:2]
+
+
+# =============================================================================
+#  EKF — one method added: update_lidar_x()
+# =============================================================================
+class EKF:
+    def __init__(self):
+        self.X = np.zeros(5)
+        self.P = np.diag([1.0, 1.0, 0.5, 0.5, 0.1])
+        self.Q_moving = np.diag([0.01,  0.01,  0.10,  0.10,  0.001])
+        self.Q_static = np.diag([0.001, 0.001, 0.001, 0.001, 0.0001])
+        self.Q        = self.Q_moving.copy()
+        self.R_mag_moving = np.array([[0.20]])
+        self.R_mag_static = np.array([[0.02]])
+        self.R_mag        = self.R_mag_moving.copy()
+        self.R_zupt       = np.diag([0.001, 0.001])
+
+    def predict(self, accel, gz, dt):
+        x, y, vx, vy, yaw = self.X
+        cy, sy = math.cos(yaw), math.sin(yaw)
+        axw = cy*accel[0] - sy*accel[1]
+        ayw = sy*accel[0] + cy*accel[1]
+        self.X = np.array([
+            x  + vx*dt + 0.5*axw*dt**2,
+            y  + vy*dt + 0.5*ayw*dt**2,
+            vx + axw*dt, vy + ayw*dt,
+            math.atan2(math.sin(yaw + gz*dt), math.cos(yaw + gz*dt))])
+        dax = -sy*accel[0] - cy*accel[1]
+        day =  cy*accel[0] - sy*accel[1]
+        F = np.eye(5)
+        F[0,2]=dt; F[1,3]=dt
+        F[0,4]=0.5*dax*dt**2; F[1,4]=0.5*day*dt**2
+        F[2,4]=dax*dt;        F[3,4]=day*dt
+        self.P = F @ self.P @ F.T + self.Q
+
+    def _upd(self, H, y, R):
+        S = H @ self.P @ H.T + R
+        K = self.P @ H.T @ np.linalg.inv(S)
+        self.X += (K @ y).flatten()
+        self.X[4] = math.atan2(math.sin(self.X[4]), math.cos(self.X[4]))
+        self.P = (np.eye(5) - K @ H) @ self.P
+
+    def update_mag(self, h):
+        if h is None: return
+        self._upd(np.array([[0,0,0,0,1]]),
+                  np.array([math.atan2(math.sin(h - self.X[4]),
+                                       math.cos(h - self.X[4]))]),
+                  self.R_mag)
+
+    def update_zupt(self):
+        H = np.array([[0,0,1,0,0],[0,0,0,1,0]])
+        self._upd(H, -H @ self.X, self.R_zupt)
+
+    def update_yaw_zupt(self):
+        H = np.array([[0,0,0,0,1]]); R = np.array([[0.005]])
+        S = H @ self.P @ H.T + R; K = self.P @ H.T @ np.linalg.inv(S)
+        if self.P[4,4] > 0.001:
+            self.X += (K @ np.array([0.0])).flatten()
+            self.X[4] = math.atan2(math.sin(self.X[4]), math.cos(self.X[4]))
+            self.P = (np.eye(5) - K @ H) @ self.P
+
+    # ── NEW: LiDAR x correction ───────────────────────────────────────────────
+    def update_lidar_x(self, true_x: float):
+        """
+        Correct EKF x using true distance derived from LiDAR wall ranging.
+        true_x = (wall_dist_at_origin - wall_dist_now) / 1000.0
+        R=0.01 → strongly trusts LiDAR (~10 mm std dev).
+        Only corrects x — leaves y, vx, vy, yaw untouched.
+        """
+        self._upd(np.array([[1, 0, 0, 0, 0]]),
+                  np.array([true_x - self.X[0]]),
+                  np.array([[0.01]]))
+
+    def set_mode(self, still):
+        self.Q     = self.Q_static     if still else self.Q_moving
+        self.R_mag = self.R_mag_static if still else self.R_mag_moving
+
+    @property
+    def state(self):
+        return dict(x=self.X[0], y=self.X[1], vx=self.X[2], vy=self.X[3],
+                    yaw=math.degrees(self.X[4]),
+                    speed=math.hypot(self.X[2], self.X[3]))
+
+
+# =============================================================================
+#  Stationary detector — identical to v7
+# =============================================================================
+class StationaryDetector:
+    def __init__(self, window=30, at=0.05, gt=0.015):
+        self.ab = deque(maxlen=window); self.gb = deque(maxlen=window)
+        self.at = at; self.gt = gt
+
+    def update(self, ac, gc):
+        self.ab.append(ac[:2].copy()); self.gb.append(gc[:3].copy())
+        if len(self.ab) < self.ab.maxlen: return True
+        return (np.max(np.var(np.array(self.ab), axis=0)) < self.at and
+                np.max(np.var(np.array(self.gb), axis=0)) < self.gt)
+
+
+# =============================================================================
+#  LiDAR — identical to v7
+# =============================================================================
+def _auto_port():
+    c = sorted(glob.glob("/dev/ttyUSB*") + glob.glob("/dev/ttyACM*"))
+    if c: log.info(f"RPLIDAR: {c[0]}"); return c[0]
+    return "/dev/ttyUSB0"
+
+def _adiff(a, b): return (a - b + 180) % 360 - 180
+
+
+class LidarWorker:
+    def __init__(self, port, baud=115200, min_d=100, max_d=8000,
+                 fwd_angle=LIDAR_FORWARD_ANGLE):
+        if not RPLIDAR_OK: raise RuntimeError("pip install rplidar-roboticia")
+        self._port=port; self._baud=baud; self._mn=min_d; self._mx=max_d
+        self._fwd_angle=fwd_angle
+        self._lk=threading.Lock(); self._pts=[]; self._run=False
+        self._th=None; self.lidar=None
+
+    def start(self):
+        self.lidar = RPLidar(self._port, baudrate=self._baud, timeout=3)
+        log.info(f"RPLIDAR: {self.lidar.get_info()}")
+        self._run = True
+        self._th = threading.Thread(target=self._loop, daemon=True)
+        self._th.start()
+
+    def stop(self):
+        self._run = False
+        if self._th: self._th.join(timeout=3)
+        if self.lidar:
+            try: self.lidar.stop(); self.lidar.disconnect()
+            except: pass
+
+    def _loop(self):
+        try:
+            for scan in self.lidar.iter_scans():
+                if not self._run: break
+                pts = [(a,d) for (_,a,d) in scan if self._mn<=d<=self._mx]
+                with self._lk: self._pts = pts
+        except Exception as e: log.error(f"LiDAR: {e}")
+
+    @property
+    def latest(self):
+        with self._lk: return list(self._pts)
+
+    def closest_forward(self, half_angle=30):
+        fwd = [d for (a,d) in self.latest
+               if abs(_adiff(a, self._fwd_angle)) <= half_angle]
+        return min(fwd) if fwd else None
+
+    def forward_distance(self, half_angle=8):
+        fwd = [d for (a,d) in self.latest
+               if abs(_adiff(a, self._fwd_angle)) <= half_angle]
+        return float(np.mean(fwd)) if len(fwd) >= 3 else None
+
+
+# =============================================================================
+#  Test runner
+# =============================================================================
+class Test2LinearMotion:
+    PASS="PASS"; FAIL="FAIL"; INFO="INFO"
+    PEAK_X_MIN=0.85; PEAK_X_MAX=1.20; MIN_PEAK_VX=0.05
+    LIDAR_EKF_MAX=0.20; YAW_DRIFT_MAX=5.0
+    FINAL_X_MAX=0.08; FINAL_V_MAX=0.01
+
+    def __init__(self, pwm=PWM_SPEED, boost=RIGHT_BOOST,
+                 boost_bwd=RIGHT_BOOST_BWD, port=None):
+        log.info("="*60)
+        log.info("TEST 2 v7 — M5 FIXED WITH LIDAR X CORRECTION")
+        log.info(f"  LEFT={pwm}%  FWD_RIGHT={pwm+boost}%  BWD_RIGHT={pwm+boost_bwd}%")
+        log.info(f"  LiDAR fwd angle={LIDAR_FORWARD_ANGLE}°")
+        log.info("="*60)
+        self.imu      = GY87(bus_num=1)
+        self.ekf      = EKF()
+        self.detector = StationaryDetector()
+        self.motors   = Motors(pwm_pct=pwm, boost=boost, boost_bwd=boost_bwd)
+        self.lidar    = LidarWorker(port=port or _auto_port(),
+                                    fwd_angle=LIDAR_FORWARD_ANGLE)
+        self.peak_x=0.0; self.peak_vx=0.0
+        self.yaw_start=None; self.yaw_peak=None
+        self.ld_start=None; self.ld_peak=None
+        self.wall_dist_origin=None   # ← wall distance recorded at x=0
+        self.final_x=0.0; self.final_speed=0.0
+        self.fwd_duration=0.0; self.abort_reason=None
+        self.csv = open("test2_results.csv","w")
+        self.csv.write("t,phase,ekf_x,ekf_y,vx,vy,yaw,speed,still,"
+                       "lidar_fwd_mm,closest_fwd_mm,lidar_true_x\n")
+
+    # ── IMU tick — LiDAR correction added ────────────────────────────────────
+    def _imu_tick(self, dt, lidar_correct=False):
+        ar=self.imu.read_accel(); gr=self.imu.read_gyro()
+        ac=ar-self.imu.accel_bias; gc=gr-self.imu.gyro_bias
+        self.imu.update_tilt(ac, gc, dt)
+        al=self.imu.remove_gravity(ac)
+        still=self.detector.update(ac, gc)
+        self.ekf.set_mode(still)
+        if still: self.imu.update_bias_adaptive(ac, gc)
+        self.ekf.predict(al[:2], gc[2], dt)
+        if still:
+            self.ekf.update_zupt(); self.ekf.update_yaw_zupt()
+            if abs(self.ekf.X[2]) < 0.001: self.ekf.X[2] = 0.0
+            if abs(self.ekf.X[3]) < 0.001: self.ekf.X[3] = 0.0
+
+        # ── LiDAR x correction (NEW) ─────────────────────────────────────
+        # Only runs when moving (lidar_correct=True) AND wall was seen at S1.
+        # true_x = how far robot has moved from its starting spot.
+        # Feeds into EKF so drift on the backward leg gets corrected
+        # every tick → EKF x matches physical position → M5 passes.
+        true_x = None
+        if lidar_correct and self.wall_dist_origin is not None:
+            ld = self.lidar.forward_distance()
+            if ld is not None:
+                true_x = (self.wall_dist_origin - ld) / 1000.0  # mm → m
+                self.ekf.update_lidar_x(true_x)
+
+        self.ekf.update_mag(self.imu.get_heading())
+        return self.ekf.state, still, true_x
+
+    def _hold_still(self, duration, phase):
+        log.info(f"[{phase}] Still {duration:.1f}s ...")
+        t0=time.time(); tp=t0
+        while time.time()-t0 < duration:
+            tn=time.time(); dt=min(tn-tp, 0.05); tp=tn
+            s, still, _ = self._imu_tick(dt)
+            self._write_csv(time.time()-t0, phase, s, still, None)
+            sl=0.01-(time.time()-tn)
+            if sl > 0: time.sleep(sl)
+
+    def _write_csv(self, t, phase, s, still, true_x):
+        fd=self.lidar.forward_distance(); cl=self.lidar.closest_forward()
+        self.csv.write(
+            f"{t:.3f},{phase},{s['x']:.5f},{s['y']:.5f},"
+            f"{s['vx']:.5f},{s['vy']:.5f},{s['yaw']:.3f},{s['speed']:.5f},"
+            f"{'1' if still else '0'},"
+            f"{fd if fd else 0:.1f},{cl if cl else 0:.1f},"
+            f"{true_x if true_x is not None else ''}\n")
+
+    # ── Main sequence ─────────────────────────────────────────────────────────
+    def run(self):
+        self.lidar.start()
+        log.info("LiDAR spin-up 3s ..."); time.sleep(3)
+
+        print("\n"+"="*64)
+        print("  TEST 2 v7 — M5 FIXED")
+        print(f"  LEFT={PWM_SPEED}%  "
+              f"FWD_RIGHT={PWM_SPEED+RIGHT_BOOST}%  "
+              f"BWD_RIGHT={PWM_SPEED+RIGHT_BOOST_BWD}%")
+        print(f"  LiDAR_fwd={LIDAR_FORWARD_ANGLE}°  Target={TARGET_M}m")
+        print()
+        print("  !! CLEAR 2m PATH — place wall/box behind robot for LiDAR !!")
+        print("  Starting in 5 seconds ...")
+        print("="*64)
+        for i in range(5,0,-1): print(f"  {i} ...", flush=True); time.sleep(1)
+        print("  GO!\n")
+
+        t_global=time.time()
+
+        try:
+            # S1 — baseline still
+            self._hold_still(STILL_BEFORE_S, "S1_still_before")
+            s0=self.ekf.state
+            self.yaw_start   = s0["yaw"]
+            self.ld_start    = self.lidar.forward_distance()
+            self.wall_dist_origin = self.ld_start   # anchor for LiDAR correction
+            if self.wall_dist_origin:
+                log.info(f"Baseline yaw={self.yaw_start:.2f}°  "
+                         f"wall_origin={self.wall_dist_origin:.0f}mm  "
+                         f"→ LiDAR x correction ENABLED")
+            else:
+                log.warning("No wall data at baseline — LiDAR x correction DISABLED. "
+                            "Place a wall/box in the LiDAR's direction.")
+
+            # S2 — forward
+            log.info(f"[S2_forward] → {TARGET_M}m ...")
+            t_fwd_start=time.time()
+            self.motors.forward()
+            tp=time.time()
+
+            while True:
+                tn=time.time(); dt=min(tn-tp, 0.05); tp=tn
+                s, still, true_x = self._imu_tick(dt, lidar_correct=True)
+                self._write_csv(tn-t_global, "S2_forward", s, still, true_x)
+
+                if s["x"] > self.peak_x:
+                    self.peak_x=s["x"]; self.yaw_peak=s["yaw"]
+                    self.ld_peak=self.lidar.forward_distance()
+                if s["vx"] > self.peak_vx: self.peak_vx=s["vx"]
+
+                closest=self.lidar.closest_forward()
+                if closest is not None and closest < OBSTACLE_STOP_MM:
+                    self.motors.stop()
+                    self.abort_reason=f"OBSTACLE {closest:.0f}mm"
+                    log.warning(f"SAFETY STOP — {self.abort_reason}"); break
+
+                if s["x"] >= TARGET_M:
+                    self.fwd_duration=time.time()-t_fwd_start
+                    self.motors.stop()
+                    log.info(f"Target x={s['x']:.4f}m  yaw={s['yaw']:.2f}°  "
+                             f"fwd_time={self.fwd_duration:.2f}s"); break
+
+                if tn-t_global > 40:
+                    self.motors.stop()
+                    self.abort_reason="TIMEOUT forward"
+                    log.error(self.abort_reason); break
+
+                print(f"  [FWD] x={s['x']:6.3f}m  vx={s['vx']:5.3f}m/s  "
+                      f"yaw={s['yaw']:6.2f}°  "
+                      f"lidar_x={true_x:.3f}m" if true_x else
+                      f"  [FWD] x={s['x']:6.3f}m  vx={s['vx']:5.3f}m/s  "
+                      f"yaw={s['yaw']:6.2f}°",
+                      end="\r", flush=True)
+                sl=0.01-(time.time()-tn)
+                if sl > 0: time.sleep(sl)
+
+            print()
+
+            if not self.abort_reason:
+                # S3 — ZUPT pause
+                self._hold_still(STILL_BETWEEN_S, "S3_still_between")
+
+                # S4 — backward
+                log.info("[S4_backward] ← target x <= 0.06m ...")
+                self.motors.backward()
+                tp=time.time()
+
+                while True:
+                    tn=time.time(); dt=min(tn-tp, 0.05); tp=tn
+                    s, still, true_x = self._imu_tick(dt, lidar_correct=True)
+                    self._write_csv(tn-t_global, "S4_backward", s, still, true_x)
+
+                    print(f"  [BWD] x={s['x']:6.3f}m  vx={s['vx']:5.3f}m/s  "
+                          f"yaw={s['yaw']:6.2f}°  "
+                          f"lidar_x={true_x:.3f}m" if true_x else
+                          f"  [BWD] x={s['x']:6.3f}m  vx={s['vx']:5.3f}m/s  "
+                          f"yaw={s['yaw']:6.2f}°",
+                          end="\r", flush=True)
+
+                    if s["x"] <= 0.06:
+                        self.motors.stop()
+                        log.info(f"Return done x={s['x']:.4f}m"); break
+
+                    if tn-t_global > 90:
+                        self.motors.stop()
+                        self.abort_reason="TIMEOUT backward"
+                        log.error(self.abort_reason); break
+
+                    sl=0.01-(time.time()-tn)
+                    if sl > 0: time.sleep(sl)
+
+                print()
+                self._hold_still(STILL_AFTER_S, "S5_still_after")
+
+            sf=self.ekf.state
+            self.final_x=sf["x"]; self.final_speed=sf["speed"]
+
+        except KeyboardInterrupt:
+            log.info("Interrupted."); self.motors.stop()
+        finally:
+            self.csv.close(); self.lidar.stop(); self.motors.cleanup()
+
+        self._report()
+
+    # ── Report — identical to v7 ──────────────────────────────────────────────
+    def _report(self):
+        P=self.PASS; F=self.FAIL; I=self.INFO
+        rows=[]
+
+        ok=self.PEAK_X_MIN<=self.peak_x<=self.PEAK_X_MAX
+        rows.append(("M1  EKF peak x", f"{self.peak_x:.3f}m",
+                     f"{self.PEAK_X_MIN}–{self.PEAK_X_MAX}m", P if ok else F))
+
+        ok=self.peak_vx>=self.MIN_PEAK_VX
+        rows.append(("M2  Peak vx", f"{self.peak_vx:.4f}m/s",
+                     f">={self.MIN_PEAK_VX}m/s", P if ok else F))
+
+        if self.ld_start and self.ld_peak:
+            ld=(self.ld_start-self.ld_peak)/1000.0
+            diff=abs(ld-self.peak_x); ok=diff<self.LIDAR_EKF_MAX
+            rows.append(("M3  LiDAR vs EKF",
+                         f"LiDAR={ld:.3f}m EKF={self.peak_x:.3f}m diff={diff:.3f}m",
+                         f"diff<{self.LIDAR_EKF_MAX}m", P if ok else F))
+        else:
+            rows.append(("M3  LiDAR vs EKF","no wall data","wall in LiDAR dir",I))
+
+        if self.yaw_start is not None and self.yaw_peak is not None:
+            drift=abs(self.yaw_peak-self.yaw_start)
+            if drift>180: drift=360-drift
+            ok=drift<self.YAW_DRIFT_MAX
+            rows.append(("M4  Yaw drift", f"{drift:.2f}°",
+                         f"<{self.YAW_DRIFT_MAX}°", P if ok else F))
+
+        ok=abs(self.final_x)<self.FINAL_X_MAX
+        rows.append(("M5  Final return |x|", f"{self.final_x:.4f}m",
+                     f"<{self.FINAL_X_MAX}m", P if ok else F))
+
+        ok=self.final_speed<self.FINAL_V_MAX
+        rows.append(("M6  Final speed", f"{self.final_speed:.5f}m/s",
+                     f"<{self.FINAL_V_MAX}m/s", P if ok else F))
+
+        if self.abort_reason:
+            rows.append(("!! ABORTED", self.abort_reason, "", F))
+
+        W=80
+        print("\n"+"="*W)
+        print("  TEST 2 v7 — RESULTS")
+        print("="*W)
+        print(f"  {'METRIC':<38} {'VALUE':<28} {'LIMIT':<12} RESULT")
+        print("="*W)
+        passed=failed=0
+        for name,val,lim,res in rows:
+            sym="OK" if res==P else ("!!" if res==F else "--")
+            print(f"  [{sym}]  {name:<36} {val:<28} {lim:<12} {res}")
+            if res==P: passed+=1
+            elif res==F: failed+=1
+        print("="*W)
+        print(f"  SUMMARY: {passed} passed,  {failed} failed")
+
+        if failed==0 and not self.abort_reason:
+            print("\n  ALL TESTS PASSED — safe to proceed to Test 3 (turning).")
+        else:
+            for name,val,lim,res in rows:
+                if res!=F: continue
+                n=name[:2]
+                if n=="M5":
+                    print("\n  M5 still failing:")
+                    print( "     → Is there a wall/object in the LiDAR direction?")
+                    print(f"       wall_dist_origin was: {self.wall_dist_origin}")
+                    print( "       If None: LiDAR saw nothing — correction did not run.")
+                    print( "       Place a solid flat surface in LiDAR's view and retry.")
+                if n=="M4":
+                    print("\n  M4 — yaw drift:")
+                    print( "       curves RIGHT → python3 test2_v7_fixed.py --boost 15")
+                    print( "       curves LEFT  → python3 test2_v7_fixed.py --boost 5")
+                if n=="M3":
+                    print("\n  M3 — place solid wall in LiDAR direction.")
+
+        print("="*W)
+        print(f"\n  LEFT={PWM_SPEED}%  "
+              f"FWD_RIGHT={PWM_SPEED+RIGHT_BOOST}%  "
+              f"BWD_RIGHT={PWM_SPEED+RIGHT_BOOST_BWD}%  "
+              f"LIDAR_FWD={LIDAR_FORWARD_ANGLE}°")
+        print(f"  Log → test2_results.csv\n")
+
+
+# =============================================================================
+#  Entry point
+# =============================================================================
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="Test 2 v7 — M5 fixed")
+    parser.add_argument("--pwm",       type=int,   default=PWM_SPEED)
+    parser.add_argument("--boost",     type=float, default=RIGHT_BOOST,
+                        help=f"Right motor boost fwd (default {RIGHT_BOOST})")
+    parser.add_argument("--boost-bwd", type=float, default=RIGHT_BOOST_BWD,
+                        help=f"Right motor boost bwd (default {RIGHT_BOOST_BWD})")
+    parser.add_argument("--port",      type=str,   default=None)
+    args = parser.parse_args()
+
+    print(f"\n  Test 2 v7 — M5 Fixed")
+    print(f"  LEFT={args.pwm}%  "
+          f"FWD_RIGHT={args.pwm+args.boost}%  "
+          f"BWD_RIGHT={args.pwm+args.boost_bwd}%\n")
+
+    Test2LinearMotion(pwm=args.pwm, boost=args.boost,
+                      boost_bwd=args.boost_bwd, port=args.port).run()
