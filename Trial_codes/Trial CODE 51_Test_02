@@ -16,7 +16,7 @@ ONLY CHANGES FROM v7
 EVERYTHING ELSE IDENTICAL TO v7
 ---------------------------------
   PWM_SPEED       = 50
-  RIGHT_BOOST     = 8  (forward)
+  RIGHT_BOOST     = 8  (forward) 
   RIGHT_BOOST_BWD = 6.5   (backward)
   LIDAR_FORWARD_ANGLE = 180
   STILL_BETWEEN_S = 5.0
