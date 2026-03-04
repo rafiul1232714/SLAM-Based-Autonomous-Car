@@ -1,0 +1,20 @@
+===============================================================================
+  TEST 2 v7 — RESULTS
+================================================================================
+  METRIC                                 VALUE                        LIMIT        RESULT
+================================================================================
+  [OK]  M1  EKF peak x                       1.001m                       0.85–1.2m    PASS
+  [OK]  M2  Peak vx                          0.4694m/s                    >=0.05m/s    PASS
+  [OK]  M3  LiDAR vs EKF                     LiDAR=1.144m EKF=1.001m diff=0.143m diff<0.2m    PASS
+  [OK]  M4  Yaw drift                        3.16°                        <5.0°        PASS
+  [!!]  M5  Final return |x|                 0.2876m                      <0.08m       FAIL
+  [OK]  M6  Final speed                      0.00000m/s                   <0.01m/s     PASS
+================================================================================
+  SUMMARY: 5 passed,  1 failed
+
+  Current: LEFT=50%  RIGHT=58%  boost=+8.0
+
+  M5 — Fix M4 first. Time-matched return is active.
+================================================================================
+
+  LEFT=50%  RIGHT=58%  boost=+8.0  LIDAR_FW
