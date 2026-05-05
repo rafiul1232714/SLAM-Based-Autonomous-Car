@@ -1,0 +1,289 @@
+#!/usr/bin/env python3
+"""
+MINIMAL RECTANGLE TEST - Motor Control Only
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Simple version without EKF for quick testing.
+
+MOTION SEQUENCE:
+  1. Wait 3 seconds (calibration)
+  2. FORWARD 500mm at 80mm/s (~6.25 seconds)
+  3. Wait 5 seconds
+  4. RIGHT TURN 90° (~1.5 seconds)
+  5. FORWARD 300mm at 80mm/s (~3.75 seconds)
+  6. Wait 5 seconds
+  7. BACKWARD 500mm at 80mm/s (~6.25 seconds)
+  8. Wait 5 seconds
+  9. LEFT TURN 90° (~1.5 seconds)
+  10. FORWARD 300mm at 80mm/s (~3.75 seconds)
+  11. Wait 4 seconds
+
+Total time: ~50 seconds
+
+═══════════════════════════════════════════════════════════════════════════════
+"""
+
+import time
+import math
+
+try:
+    import RPi.GPIO as GPIO
+    GPIO_OK = True
+except ImportError:
+    GPIO_OK = False
+    print("⚠ RPi.GPIO not available")
+
+# ─────────────────────────────────────────────────────────────────────────────
+# MOTOR CONFIGURATION
+# ─────────────────────────────────────────────────────────────────────────────
+
+PWM_SPEED = 50           # Base PWM duty cycle (%)
+RIGHT_BOOST = 7.9        # Right motor correction boost
+RIGHT_BOOST_BWD = 7.9    # Right motor backward correction
+PWM_FREQ = 1000          # 1 kHz PWM frequency
+
+# GPIO Pin mapping
+ENA_PIN = 12        # Left motor PWM enable
+IN1_PIN = 13        # Left motor forward
+IN2_PIN = 11        # Left motor backward
+IN3_PIN = 16        # Right motor forward
+IN4_PIN = 15        # Right motor backward
+ENB_PIN = 35        # Right motor PWM enable
+
+# ─────────────────────────────────────────────────────────────────────────────
+# SIMPLE MOTOR CLASS
+# ─────────────────────────────────────────────────────────────────────────────
+
+class Motor:
+    """Simple L298N motor controller"""
+    
+    def __init__(self, pwm=PWM_SPEED, boost=RIGHT_BOOST, boost_bwd=RIGHT_BOOST_BWD):
+        self.pwm = pwm
+        self.right_fwd = pwm + boost
+        self.right_bwd = pwm + boost_bwd
+        
+        if GPIO_OK:
+            GPIO.setmode(GPIO.BOARD)
+            GPIO.setwarnings(False)
+            
+            # Setup pins
+            for pin in [IN1_PIN, IN2_PIN, IN3_PIN, IN4_PIN]:
+                GPIO.setup(pin, GPIO.OUT)
+                GPIO.output(pin, GPIO.LOW)
+            
+            GPIO.setup(ENA_PIN, GPIO.OUT)
+            GPIO.setup(ENB_PIN, GPIO.OUT)
+            
+            # Create PWM
+            self.pwm_left = GPIO.PWM(ENA_PIN, PWM_FREQ)
+            self.pwm_right = GPIO.PWM(ENB_PIN, PWM_FREQ)
+            self.pwm_left.start(0)
+            self.pwm_right.start(0)
+            
+            print(f"✓ GPIO ready")
+            print(f"  LEFT motor:    {self.pwm}%")
+            print(f"  RIGHT motor FWD: {self.right_fwd}%")
+            print(f"  RIGHT motor BWD: {self.right_bwd}%")
+        else:
+            print("! GPIO not available - simulation mode")
+    
+    def forward(self):
+        """Drive forward"""
+        if not GPIO_OK:
+            print(">> FORWARD")
+            return
+        
+        GPIO.output(IN1_PIN, GPIO.HIGH)
+        GPIO.output(IN2_PIN, GPIO.LOW)
+        GPIO.output(IN3_PIN, GPIO.LOW)
+        GPIO.output(IN4_PIN, GPIO.HIGH)
+        
+        self.pwm_left.ChangeDutyCycle(self.pwm)
+        self.pwm_right.ChangeDutyCycle(self.right_fwd)
+        print(f">> FORWARD (L={self.pwm}% R={self.right_fwd}%)")
+    
+    def backward(self):
+        """Drive backward"""
+        if not GPIO_OK:
+            print(">> BACKWARD")
+            return
+        
+        GPIO.output(IN1_PIN, GPIO.LOW)
+        GPIO.output(IN2_PIN, GPIO.HIGH)
+        GPIO.output(IN3_PIN, GPIO.HIGH)
+        GPIO.output(IN4_PIN, GPIO.LOW)
+        
+        self.pwm_left.ChangeDutyCycle(self.pwm)
+        self.pwm_right.ChangeDutyCycle(self.right_bwd)
+        print(f">> BACKWARD (L={self.pwm}% R={self.right_bwd}%)")
+    
+    def turn_right(self):
+        """Turn right 90°: reverse left, forward right"""
+        if not GPIO_OK:
+            print(">> TURN RIGHT")
+            return
+        
+        GPIO.output(IN1_PIN, GPIO.LOW)
+        GPIO.output(IN2_PIN, GPIO.HIGH)
+        GPIO.output(IN3_PIN, GPIO.LOW)
+        GPIO.output(IN4_PIN, GPIO.HIGH)
+        
+        self.pwm_left.ChangeDutyCycle(self.pwm)
+        self.pwm_right.ChangeDutyCycle(self.right_fwd)
+        print(">> TURN RIGHT (90°)")
+    
+    def turn_left(self):
+        """Turn left 90°: forward left, reverse right"""
+        if not GPIO_OK:
+            print(">> TURN LEFT")
+            return
+        
+        GPIO.output(IN1_PIN, GPIO.HIGH)
+        GPIO.output(IN2_PIN, GPIO.LOW)
+        GPIO.output(IN3_PIN, GPIO.HIGH)
+        GPIO.output(IN4_PIN, GPIO.LOW)
+        
+        self.pwm_left.ChangeDutyCycle(self.pwm)
+        self.pwm_right.ChangeDutyCycle(self.right_fwd)
+        print(">> TURN LEFT (90°)")
+    
+    def stop(self):
+        """Stop motors"""
+        if not GPIO_OK:
+            print(">> STOP")
+            return
+        
+        self.pwm_left.ChangeDutyCycle(0)
+        self.pwm_right.ChangeDutyCycle(0)
+        for pin in [IN1_PIN, IN2_PIN, IN3_PIN, IN4_PIN]:
+            GPIO.output(pin, GPIO.LOW)
+        print(">> STOP")
+    
+    def cleanup(self):
+        """Cleanup"""
+        if GPIO_OK:
+            self.stop()
+            try:
+                self.pwm_left.stop()
+                self.pwm_right.stop()
+            except:
+                pass
+            GPIO.cleanup()
+
+# ─────────────────────────────────────────────────────────────────────────────
+# MOTION TIMING CALCULATIONS
+# ─────────────────────────────────────────────────────────────────────────────
+
+# Setpoint velocity: 80 mm/s = 0.08 m/s
+SETPOINT_VEL = 0.08  # m/s
+
+# Distances
+FORWARD_DIST = 0.5   # 500 mm
+TURN_DIST = 0.3      # 300 mm
+
+# Calculated durations (with 2s ramp-up included)
+# Actual time = distance / average_velocity
+# With 2s ramp from 0 to peak, average ≈ 75% of peak
+FORWARD_TIME = FORWARD_DIST / (SETPOINT_VEL * 0.75)
+TURN_TIME = TURN_DIST / (SETPOINT_VEL * 0.75)
+
+print(f"\n╔═══════════════════════════════════════════════════════════════╗")
+print(f"║ RECTANGLE TRAJECTORY TIMING CALCULATION                      ║")
+print(f"╚═══════════════════════════════════════════════════════════════╝")
+print(f"\nSetpoint velocity: {SETPOINT_VEL*1000:.0f} mm/s")
+print(f"Average velocity (with ramp): {SETPOINT_VEL*0.75*1000:.0f} mm/s")
+print(f"\nForward leg (500mm):  {FORWARD_TIME:.2f}s")
+print(f"Turn leg (300mm):     {TURN_TIME:.2f}s")
+print(f"Turn rotation (90°):  ~1.5s")
+print(f"Still phases:         3+5+5+5+4 = 22s")
+print(f"\nTotal time: ~{2*FORWARD_TIME + 2*TURN_TIME + 3 + 22}s\n")
+
+# ─────────────────────────────────────────────────────────────────────────────
+# RECTANGLE TEST
+# ─────────────────────────────────────────────────────────────────────────────
+
+def rectangle_test():
+    """Execute rectangle trajectory"""
+    
+    print("╔═══════════════════════════════════════════════════════════════╗")
+    print("║ RECTANGLE TRAJECTORY TEST                                     ║")
+    print("║ 500mm → 300mm → 500mm → 300mm (back to origin)              ║")
+    print("╚═══════════════════════════════════════════════════════════════╝\n")
+    
+    motor = Motor()
+    
+    print("Place wall behind robot for LiDAR distance measurement")
+    print("Starting in 5 seconds...\n")
+    
+    for i in range(5, 0, -1):
+        print(f"  {i}...", end=' ', flush=True)
+        time.sleep(1)
+    print("\nGO!\n")
+    
+    try:
+        # S1: Initial calibration
+        print("[S1] STILL (3s) - IMU calibration")
+        time.sleep(3)
+        
+        # S2: Forward 500mm
+        print(f"\n[S2] FORWARD ({FORWARD_DIST*1000:.0f}mm) for {FORWARD_TIME:.2f}s")
+        motor.forward()
+        time.sleep(FORWARD_TIME)
+        motor.stop()
+        
+        # S3: Wait
+        print(f"\n[S3] STILL (5s) - ZUPT correction")
+        time.sleep(5)
+        
+        # S4: Right turn + 300mm
+        print(f"\n[S4] RIGHT TURN (90°) + {TURN_DIST*1000:.0f}mm")
+        motor.turn_right()
+        time.sleep(1.5)  # Turn time
+        motor.forward()
+        time.sleep(TURN_TIME)
+        motor.stop()
+        
+        # S5: Wait
+        print(f"\n[S5] STILL (5s) - ZUPT correction")
+        time.sleep(5)
+        
+        # S6: Backward 500mm
+        print(f"\n[S6] BACKWARD ({FORWARD_DIST*1000:.0f}mm) for {FORWARD_TIME:.2f}s")
+        motor.backward()
+        time.sleep(FORWARD_TIME)
+        motor.stop()
+        
+        # S7: Wait
+        print(f"\n[S7] STILL (5s) - ZUPT correction")
+        time.sleep(5)
+        
+        # S8: Left turn + 300mm
+        print(f"\n[S8] LEFT TURN (90°) + {TURN_DIST*1000:.0f}mm")
+        motor.turn_left()
+        time.sleep(1.5)  # Turn time
+        motor.forward()
+        time.sleep(TURN_TIME)
+        motor.stop()
+        
+        # S9: Final wait
+        print(f"\n[S9] STILL (4s) - final calibration")
+        time.sleep(4)
+        
+        print("\n" + "="*60)
+        print("TEST COMPLETE - Robot should be back at origin!")
+        print("="*60)
+    
+    except KeyboardInterrupt:
+        print("\n\nInterrupted by user")
+        motor.stop()
+    
+    finally:
+        motor.cleanup()
+        print("\nMotors stopped, GPIO cleaned up")
+
+# ─────────────────────────────────────────────────────────────────────────────
+# ENTRY POINT
+# ─────────────────────────────────────────────────────────────────────────────
+
+if __name__ == "__main__":
+    rectangle_test()
