@@ -1,0 +1,339 @@
+cat > rectangle_step2_WORKING_FIXED_PWM.py <<'PY'
+import RPi.GPIO as GPIO
+import time
+import smbus
+import math
+import socket
+import json
+
+GPIO.setmode(GPIO.BOARD)
+GPIO.setwarnings(False)
+
+# =========================
+# Laptop MATLAB UDP
+# =========================
+LAPTOP_IP = "192.168.0.181"
+UDP_PORT = 5007
+udp_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+
+# =========================
+# L298N pins, BOARD mode
+# =========================
+ENA_PIN = 12
+IN1_PIN = 13
+IN2_PIN = 11
+
+IN3_PIN = 16
+IN4_PIN = 15
+ENB_PIN = 35
+
+# =========================
+# Motor values from successful tests
+# =========================
+FWD_LEFT_PWM = 50
+FWD_RIGHT_PWM = 57
+
+# Yaw correction disabled for forward movement.
+# Forward uses fixed calibrated PWM.
+K_STRAIGHT = 0.0
+MAX_STRAIGHT_CORR = 0
+
+TURN_PWM = 60
+TURN_TARGET_DEG = 90
+TURN_TOLERANCE_DEG = 5
+
+SET_VELOCITY_MM_S = 80
+
+MAX_FORWARD_TIME = 6.0
+MAX_TURN_TIME = 8.0
+
+# =========================
+# MPU6050 gyro Z
+# =========================
+MPU_ADDR = 0x68
+PWR_MGMT_1 = 0x6B
+GYRO_ZOUT_H = 0x47
+
+bus = smbus.SMBus(1)
+bus.write_byte_data(MPU_ADDR, PWR_MGMT_1, 0)
+
+def read_word(reg):
+    high = bus.read_byte_data(MPU_ADDR, reg)
+    low = bus.read_byte_data(MPU_ADDR, reg + 1)
+    value = (high << 8) | low
+
+    if value >= 0x8000:
+        value = -((65535 - value) + 1)
+
+    return value
+
+def read_gyro_z_dps():
+    return read_word(GYRO_ZOUT_H) / 131.0
+
+def clamp(value, low, high):
+    return max(low, min(high, value))
+
+def wrap_angle(angle):
+    return math.atan2(
+        math.sin(math.radians(angle)),
+        math.cos(math.radians(angle))
+    ) * 180.0 / math.pi
+
+# =========================
+# GPIO setup
+# =========================
+for pin in [IN1_PIN, IN2_PIN, IN3_PIN, IN4_PIN, ENA_PIN, ENB_PIN]:
+    GPIO.setup(pin, GPIO.OUT)
+
+pwm_left = GPIO.PWM(ENA_PIN, 1000)
+pwm_right = GPIO.PWM(ENB_PIN, 1000)
+
+pwm_left.start(0)
+pwm_right.start(0)
+
+# =========================
+# Motor functions
+# =========================
+def stop():
+    pwm_left.ChangeDutyCycle(0)
+    pwm_right.ChangeDutyCycle(0)
+
+    GPIO.output(IN1_PIN, GPIO.LOW)
+    GPIO.output(IN2_PIN, GPIO.LOW)
+    GPIO.output(IN3_PIN, GPIO.LOW)
+    GPIO.output(IN4_PIN, GPIO.LOW)
+
+def set_forward(left_pwm, right_pwm):
+    left_pwm = clamp(left_pwm, 0, 100)
+    right_pwm = clamp(right_pwm, 0, 100)
+
+    GPIO.output(IN1_PIN, GPIO.HIGH)
+    GPIO.output(IN2_PIN, GPIO.LOW)
+
+    GPIO.output(IN3_PIN, GPIO.LOW)
+    GPIO.output(IN4_PIN, GPIO.HIGH)
+
+    pwm_left.ChangeDutyCycle(left_pwm)
+    pwm_right.ChangeDutyCycle(right_pwm)
+
+def set_turn_right():
+    # left wheel forward, right wheel backward
+    GPIO.output(IN1_PIN, GPIO.HIGH)
+    GPIO.output(IN2_PIN, GPIO.LOW)
+
+    GPIO.output(IN3_PIN, GPIO.HIGH)
+    GPIO.output(IN4_PIN, GPIO.LOW)
+
+    pwm_left.ChangeDutyCycle(TURN_PWM)
+    pwm_right.ChangeDutyCycle(TURN_PWM)
+
+# =========================
+# MATLAB UDP sender
+# =========================
+def send_matlab(t, set_vel, actual_vel, set_yaw, actual_yaw, dist_mm, pwm_l, pwm_r, phase):
+    packet = {
+        "time": round(t, 3),
+        "set_velocity_mm_s": round(set_vel, 2),
+        "actual_velocity_mm_s": round(actual_vel, 2),
+        "set_yaw_deg": round(set_yaw, 2),
+        "actual_yaw_deg": round(actual_yaw, 2),
+        "distance_mm": round(dist_mm, 2),
+        "pwm_left": round(pwm_l, 2),
+        "pwm_right": round(pwm_r, 2),
+        "lidar_front_mm": 0,
+        "phase": phase
+    }
+
+    try:
+        msg = json.dumps(packet).encode("utf-8")
+        udp_sock.sendto(msg, (LAPTOP_IP, UDP_PORT))
+    except Exception as e:
+        print("MATLAB UDP error:", e)
+
+# =========================
+# Gyro calibration
+# =========================
+def calibrate_gyro():
+    print("Keep car still. Calibrating gyro Z...")
+    samples = 300
+    bias_sum = 0.0
+
+    for _ in range(samples):
+        bias_sum += read_gyro_z_dps()
+        time.sleep(0.01)
+
+    bias = bias_sum / samples
+    print(f"gyro_z_bias = {bias:.3f} deg/s")
+    return bias
+
+# =========================
+# Forward movement
+# =========================
+def move_forward(distance_target_mm, yaw_setpoint, start_distance_mm, gyro_bias, global_start, phase_name):
+    print(f"Moving forward {distance_target_mm} mm with yaw target {yaw_setpoint} deg...")
+
+    yaw = yaw_setpoint
+    distance_local = 0.0
+    total_distance = start_distance_mm
+
+    start_time = time.time()
+    last_time = time.time()
+
+    while True:
+        now = time.time()
+        dt = now - last_time
+        last_time = now
+
+        t_local = now - start_time
+        t_global = now - global_start
+
+        gyro_z = read_gyro_z_dps() - gyro_bias
+        yaw += gyro_z * dt
+        yaw = wrap_angle(yaw)
+
+        # Forward movement uses fixed calibrated PWM.
+        # Yaw is measured and logged only.
+        correction = 0.0
+        left_cmd = FWD_LEFT_PWM
+        right_cmd = FWD_RIGHT_PWM
+
+        set_forward(left_cmd, right_cmd)
+
+        distance_local += SET_VELOCITY_MM_S * dt
+        total_distance = start_distance_mm + distance_local
+
+        send_matlab(
+            t_global,
+            SET_VELOCITY_MM_S,
+            SET_VELOCITY_MM_S,
+            yaw_setpoint,
+            yaw,
+            total_distance,
+            left_cmd,
+            right_cmd,
+            phase_name
+        )
+
+        print(
+            f"{phase_name} t={t_local:.2f}s dist={total_distance:.1f}mm "
+            f"yaw={yaw:.2f} target={yaw_setpoint} L={left_cmd:.1f} R={right_cmd:.1f}",
+            end="\r"
+        )
+
+        if distance_local >= distance_target_mm:
+            break
+
+        if t_local >= MAX_FORWARD_TIME:
+            print("\nForward safety timeout")
+            break
+
+        time.sleep(0.02)
+
+    print("\nSTOP after forward")
+    stop()
+    time.sleep(1.0)
+
+    return total_distance
+
+# =========================
+# Right turn
+# =========================
+def turn_right_90(gyro_bias, global_start, current_distance_mm):
+    print("Turning right 90 degrees...")
+
+    yaw = 0.0
+    yaw_setpoint = -90.0
+
+    start_time = time.time()
+    last_time = time.time()
+
+    while True:
+        now = time.time()
+        dt = now - last_time
+        last_time = now
+
+        t_local = now - start_time
+        t_global = now - global_start
+
+        gyro_z = read_gyro_z_dps() - gyro_bias
+        yaw += gyro_z * dt
+        yaw = wrap_angle(yaw)
+
+        set_turn_right()
+
+        send_matlab(
+            t_global,
+            0,
+            0,
+            yaw_setpoint,
+            yaw,
+            current_distance_mm,
+            TURN_PWM,
+            TURN_PWM,
+            "turn_right"
+        )
+
+        print(f"TURN t={t_local:.2f}s yaw={yaw:.2f} target=-90", end="\r")
+
+        if abs(abs(yaw) - TURN_TARGET_DEG) <= TURN_TOLERANCE_DEG:
+            break
+
+        if t_local >= MAX_TURN_TIME:
+            print("\nTurn safety timeout")
+            break
+
+        time.sleep(0.02)
+
+    print("\nSTOP after turn")
+    stop()
+    time.sleep(1.0)
+
+# =========================
+# Main Step 2 L-shape test
+# =========================
+try:
+    gyro_bias = calibrate_gyro()
+
+    print("\nSTEP 2 TEST:")
+    print("Forward 30 cm -> Stop -> Turn right 90 deg -> Stop -> Forward 20 cm -> Stop")
+    print("Starting in 3 seconds...")
+    time.sleep(3)
+
+    global_start = time.time()
+    total_distance = 0.0
+
+    total_distance = move_forward(
+        distance_target_mm=300,
+        yaw_setpoint=0.0,
+        start_distance_mm=total_distance,
+        gyro_bias=gyro_bias,
+        global_start=global_start,
+        phase_name="forward_1"
+    )
+
+    turn_right_90(
+        gyro_bias=gyro_bias,
+        global_start=global_start,
+        current_distance_mm=total_distance
+    )
+
+    total_distance = move_forward(
+        distance_target_mm=200,
+        yaw_setpoint=-90.0,
+        start_distance_mm=total_distance,
+        gyro_bias=gyro_bias,
+        global_start=global_start,
+        phase_name="forward_2"
+    )
+
+    print("\nStep 2 finished.")
+    print("Check MATLAB graph.")
+
+finally:
+    stop()
+    pwm_left.stop()
+    pwm_right.stop()
+    GPIO.cleanup()
+    udp_sock.close()
+    print("GPIO cleaned up.")
+PY
