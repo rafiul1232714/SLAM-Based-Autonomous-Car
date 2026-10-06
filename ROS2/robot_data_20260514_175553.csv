@@ -1,0 +1,1 @@
+ros_time,phase,t_s,x_mm,y_mm,yaw_deg,vel_mm_s,dist_mm,lidar_mm,pwmL,pwmR,track_error_mm
